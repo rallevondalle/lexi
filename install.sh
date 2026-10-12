@@ -48,11 +48,10 @@ esac
 
 if [[ -n $lang ]]; then
   mkdir -p "$CONFIG_DIR"
-  if [[ -f $CONFIG_DIR/config ]] && grep -q '^lang' "$CONFIG_DIR/config"; then
-    sed -i "s/^lang.*/lang = $lang/" "$CONFIG_DIR/config"
-  else
-    echo "lang = $lang" >>"$CONFIG_DIR/config"
-  fi
+  # Rewrite without sed -i, which differs between GNU and macOS.
+  touch "$CONFIG_DIR/config"
+  { grep -v '^lang' "$CONFIG_DIR/config" || true; echo "lang = $lang"; } >"$CONFIG_DIR/config.new"
+  mv "$CONFIG_DIR/config.new" "$CONFIG_DIR/config"
   say "Interface language set to '$lang' in $CONFIG_DIR/config"
 fi
 
@@ -83,6 +82,8 @@ if $keybinding; then
   elif [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; then
     say "Hyprland detected. Add a keybinding yourself, e.g. in hyprland.conf:"
     note "bind = SUPER ALT, D, exec, $BIN_DIR/lexi"
+  elif [[ $(uname) == Darwin ]]; then
+    say "On macOS, use the Raycast extension for the popup: see raycast/README.md"
   else
     say "Bind a key to '$BIN_DIR/lexi' in your desktop's keyboard shortcut settings to get the popup."
   fi

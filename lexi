@@ -6,6 +6,8 @@ Definitions come from Wiktionary (via kaikki.org) and Open English WordNet.
   lexi WORD          print the definition in the terminal
   lexi               ask for a word and show it in a popup window
   lexi --open WORD   show WORD in the popup window
+  lexi --json WORD   print the lookup as JSON (for integrations such as Raycast)
+  lexi --complete P  print words starting with P as JSON
   lexi update        download the dictionaries and (re)build the database
   lexi --help        show this help
 """
@@ -15,6 +17,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -172,59 +175,40 @@ def references(db, entries, seen):
     return list(found.items())[:3]
 
 
-def render_entries(entries, headword, width, out):
-    etyms = []
-    for w, _, pos, _, etym, senses in entries:
-        label = (pos or "").upper()
-        if w.lower() == headword.lower() and w != headword:
-            label += "  " + w
-        out += ["", style(label, LABEL)]
-        num = sub = 0
-        for depth, gloss, example in json.loads(senses):
-            if depth == 0:
-                num += 1
-                sub = 0
-                out += wrap(gloss, width, 0, 4, lead=style(f"{num:>2}", BOLD) + "  ")
-                hang = 4
-            else:
-                sub += 1
-                letter = chr(ord("a") + (sub - 1) % 26)
-                out += wrap(gloss, width, 4, 3, lead=style(letter, DIM) + "  ")
-                hang = 7
-            if example:
-                out += wrap(f"“{example}”", width, hang, 0, DIM, ITALIC)
-        etyms.append(etym)
-    return etyms
+def collect(word):
+    """Look word up and return the result as plain data (also what `lexi --json` prints).
 
-
-def render(word, width=TEXT_WIDTH):
-    """Return (lines, found) for word at the given text width."""
-    if not os.path.exists(DB):
-        return [style(T["no_db"], BOLD), "", T["run_update"]], False
-    db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    {"query", "found", "suggestions", "headword", "ipa",
+     "sections": [{"title", "kind": "main"|"reference"|"wordnet", "ipa",
+                   "entries": [{"word", "pos", "senses": [{"depth", "gloss", "example"}]}]}],
+     "origins": [...]}
+    """
     query = word.strip()
+    result = {"query": query, "found": False, "suggestions": [], "headword": None, "ipa": None,
+              "sections": [], "origins": []}
+    if not os.path.exists(DB):
+        result["error"] = "no_db"
+        return result
+    db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     key = query.lower()
     rows = fetch(db, key)
-    out = []
     if not rows:
-        similar = suggestions(db, key)
-        if not similar:
-            return [style(query, ACCENT), "", style(T["nothing"], DIM)], False
-        out += [style(query, ACCENT) + style("  " + T["not_found"], DIM),
-                style(T["did_you_mean"], DIM) + style(", ".join(similar), BOLD), ""]
-        key = query = similar[0]
+        result["suggestions"] = suggestions(db, key)
+        if not result["suggestions"]:
+            return result
+        key = query = result["suggestions"][0]
         rows = fetch(db, key)
+    result["found"] = True
 
     # The exact spelling (e.g. "free" before "Free") comes first.
     rows.sort(key=lambda r: (r[1], r[0] != query))
-    headword = rows[0][0]
-    ipa = next((r[3] for r in rows if r[3]), None)
-    out.append(style(headword, ACCENT) + ("   " + style(ipa, DIM) if ipa else ""))
+    result["headword"] = rows[0][0]
+    result["ipa"] = next((r[3] for r in rows if r[3]), None)
 
     # Follow references such as "Alternative spelling of X" and merge X in below.
-    sections = [(None, [r for r in rows if r[1] == WIKT])]
+    sections = [("Wiktionary", "main", [r for r in rows if r[1] == WIKT])]
     seen = {key}
-    queue = sections[0][1]
+    queue = sections[0][2]
     while queue and len(sections) < 4:
         refs = references(db, queue, seen)
         queue = []
@@ -233,41 +217,110 @@ def render(word, width=TEXT_WIDTH):
             trows = [r for r in fetch(db, target) if r[1] == WIKT]
             chosen = [r for r in trows if r[2] in poses] or trows
             if chosen:
-                sections.append((target, chosen))
+                sections.append((target, "reference", chosen))
                 queue += chosen
     wordnet = [r for r in rows if r[1] == WORDNET]
     if not wordnet:
-        for target, _ in sections[1:]:
+        for target, _, _ in sections[1:]:
             wordnet = [r for r in fetch(db, target) if r[1] == WORDNET]
             if wordnet:
                 break
     if wordnet:
-        sections.append(("WordNet", wordnet))
+        sections.append(("WordNet", "wordnet", wordnet))
 
-    etyms = []
-    for i, (title, entries) in enumerate(sections):
+    origins = []
+    for title, kind, entries in sections:
         if not entries:
             continue
-        if title is None and len(sections) > 1:
-            title = "Wiktionary"
-        if title:
-            ref = i > 0 and title != "WordNet"
-            head = f" {title} "
-            line = style("── ", DIM) + style(title, ACCENT if ref else DIM) + " "
-            if ref:
-                tipa = next((r[3] for r in entries if r[3]), None)
-                if tipa:
-                    line += style(tipa, DIM) + " "
-                    head += tipa + " "
-            out += ["", line + style("─" * max(2, width - len(head) - 3), DIM)]
-        etyms += render_entries(entries, headword if i == 0 else entries[0][0], width, out)
+        result["sections"].append({
+            "title": title,
+            "kind": kind,
+            "ipa": next((r[3] for r in entries if r[3]), None) if kind == "reference" else None,
+            "entries": [
+                {"word": w, "pos": pos, "senses": [
+                    {"depth": d, "gloss": unescape(g), "example": unescape(x) if x else None}
+                    for d, g, x in json.loads(senses)
+                ]}
+                for w, _, pos, _, _, senses in entries
+            ],
+        })
+        origins += [r[4] for r in entries if r[4]]
+    result["origins"] = list(dict.fromkeys(origins))[:3]
+    return result
 
-    etyms = list(dict.fromkeys(e for e in etyms if e))
-    if etyms:
+
+def unescape(text):
+    return re.sub(r"&?#(\d+);", lambda m: chr(int(m.group(1))), text)
+
+
+def render(word, width=TEXT_WIDTH):
+    """Return (lines, found) for word, styled for the terminal at the given text width."""
+    data = collect(word)
+    if data.get("error") == "no_db":
+        return [style(T["no_db"], BOLD), "", T["run_update"]], False
+    out = []
+    if not data["found"]:
+        return [style(data["query"], ACCENT), "", style(T["nothing"], DIM)], False
+    if data["suggestions"]:
+        out += [style(data["query"], ACCENT) + style("  " + T["not_found"], DIM),
+                style(T["did_you_mean"], DIM) + style(", ".join(data["suggestions"]), BOLD), ""]
+
+    headword = data["headword"]
+    out.append(style(headword, ACCENT) + ("   " + style(data["ipa"], DIM) if data["ipa"] else ""))
+    sections = data["sections"]
+    for i, sec in enumerate(sections):
+        if len(sections) > 1:
+            ref = sec["kind"] == "reference"
+            head = f" {sec['title']} "
+            line = style("── ", DIM) + style(sec["title"], ACCENT if ref else DIM) + " "
+            if sec["ipa"]:
+                line += style(sec["ipa"], DIM) + " "
+                head += sec["ipa"] + " "
+            out += ["", line + style("─" * max(2, width - len(head) - 3), DIM)]
+        base = headword if i == 0 else sec["entries"][0]["word"]
+        for entry in sec["entries"]:
+            label = (entry["pos"] or "").upper()
+            if entry["word"].lower() == base.lower() and entry["word"] != base:
+                label += "  " + entry["word"]
+            out += ["", style(label, LABEL)]
+            num = sub = 0
+            for sense in entry["senses"]:
+                if sense["depth"] == 0:
+                    num += 1
+                    sub = 0
+                    out += wrap(sense["gloss"], width, 0, 4, lead=style(f"{num:>2}", BOLD) + "  ")
+                    hang = 4
+                else:
+                    sub += 1
+                    letter = chr(ord("a") + (sub - 1) % 26)
+                    out += wrap(sense["gloss"], width, 4, 3, lead=style(letter, DIM) + "  ")
+                    hang = 7
+                if sense["example"]:
+                    out += wrap(f"“{sense['example']}”", width, hang, 0, DIM, ITALIC)
+
+    if data["origins"]:
         out += ["", style(T["origin"], LABEL)]
-        for i, etym in enumerate(etyms[:3]):
+        for i, etym in enumerate(data["origins"]):
             out += ([""] if i else []) + wrap(etym, width, 0, 0, DIM)
     return out, True
+
+
+def complete(prefix, limit=30):
+    """Words starting with prefix, shortest first (for launchers such as Raycast)."""
+    prefix = prefix.strip().lower()
+    if not prefix or not os.path.exists(DB):
+        return []
+    db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    hi = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+    # Common words (in WordNet) and lowercase words before names and rare forms; then shortest first.
+    words = [r[0] for r in db.execute(
+        """SELECT key FROM (SELECT key FROM words WHERE key >= ? AND key < ? LIMIT 5000) AS w
+           ORDER BY NOT EXISTS (SELECT 1 FROM entries e WHERE e.key = w.key AND e.source = 1),
+                    NOT EXISTS (SELECT 1 FROM entries e WHERE e.key = w.key AND e.word = w.key),
+                    length(key), key
+           LIMIT ?""",
+        (prefix, hi, limit))]
+    return words or suggestions(db, prefix, n=10)
 
 
 # ---------- popup window ----------
@@ -412,11 +465,27 @@ def view(word):
         input()
         return
     prompt = pad + f"?e:{T['more']}  ·  .{T['close']}  ·  {T['search']}"
+    opts = ["-R", "-c", "-~", "-K", "-Ps" + prompt]
+    # macOS ships an old less, so only use options the installed version knows.
+    version = less_version()
+    if version >= 551:
+        opts += ["--mouse", "--wheel-lines=3"]
+    if version >= 600:
+        opts += ["--use-color", "--color=PK"]
+    if version >= 643:
+        opts.append("--lesskey-content=#command\n\\e quit\n")
     subprocess.run(
-        ["less", "-R", "-c", "-~", "-K", "--mouse", "--wheel-lines=3", "--use-color", "--color=PK",
-         "-Ps" + prompt, "--lesskey-content=#command\n\\e quit\n"],
+        ["less", *opts],
         input=text, text=True,
     )
+
+
+def less_version():
+    try:
+        out = subprocess.run(["less", "--version"], capture_output=True, text=True).stdout
+        return int(re.search(r"less (\d+)", out).group(1))
+    except (OSError, AttributeError, ValueError):
+        return 0
 
 
 def ask_word():
@@ -431,6 +500,7 @@ def ask_word():
         ["bemenu", "-p", prompt],
         ["zenity", "--entry", "--title", "lexi", "--text", prompt],
         ["kdialog", "--title", "lexi", "--inputbox", prompt],
+        ["osascript", "-e", f'text returned of (display dialog "{prompt}" default answer "" with title "lexi")'],
     ]
     for cmd in candidates:
         if shutil.which(cmd[0]):
@@ -462,6 +532,10 @@ def terminal_command(title, args):
     for name, cmd in terminals:
         if shutil.which(name):
             return cmd + args
+    if sys.platform == "darwin":
+        script = " ".join(shlex.quote(a) for a in args) + "; exit"
+        return ["osascript", "-e", f"tell application \"Terminal\" to do script {json.dumps(script, ensure_ascii=False)}",
+                "-e", "tell application \"Terminal\" to activate"]
     return None
 
 
@@ -661,6 +735,10 @@ def main():
             update()
         except KeyboardInterrupt:
             sys.exit("\nlexi: update cancelled")
+    elif args[0] == "--json":
+        print(json.dumps(collect(" ".join(args[1:])), ensure_ascii=False))
+    elif args[0] == "--complete":
+        print(json.dumps(complete(" ".join(args[1:])), ensure_ascii=False))
     elif args[0] == "--open":
         launch(" ".join(args[1:]) or None)
     elif args[0] == "--view":

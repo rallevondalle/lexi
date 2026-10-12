@@ -1,0 +1,66 @@
+{
+  "$schema": "https://www.raycast.com/schemas/extension.json",
+  "name": "lexi",
+  "title": "Lexi Dictionary",
+  "description": "Fast, offline English dictionary with Wiktionary and Open English WordNet: definitions, pronunciation, examples and etymology.",
+  "icon": "icon.png",
+  "author": "rallevondalle",
+  "categories": [
+    "Productivity",
+    "Applications"
+  ],
+  "license": "MIT",
+  "commands": [
+    {
+      "name": "lookup",
+      "title": "Look up Word",
+      "subtitle": "Lexi",
+      "description": "Search the offline dictionary as you type.",
+      "mode": "view",
+      "arguments": [
+        {
+          "name": "word",
+          "placeholder": "word",
+          "type": "text",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "lookup-selection",
+      "title": "Look up Selected Text",
+      "subtitle": "Lexi",
+      "description": "Show the definition of the word selected in the frontmost app.",
+      "mode": "view"
+    }
+  ],
+  "preferences": [
+    {
+      "name": "lexiPath",
+      "title": "Path to lexi",
+      "description": "Leave empty to look in ~/.local/bin, /opt/homebrew/bin and /usr/local/bin.",
+      "type": "textfield",
+      "required": false,
+      "placeholder": "~/.local/bin/lexi"
+    }
+  ],
+  "dependencies": {
+    "@raycast/api": "^1.100.0",
+    "@raycast/utils": "^2.0.0"
+  },
+  "devDependencies": {
+    "@raycast/eslint-config": "^2.0.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "eslint": "^9.0.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.6.0"
+  },
+  "scripts": {
+    "build": "ray build",
+    "dev": "ray develop",
+    "fix-lint": "ray lint --fix",
+    "lint": "ray lint",
+    "publish": "npx @raycast/api@latest publish"
+  }
+}

@@ -1,6 +1,6 @@
 # lexi
 
-A fast, offline English dictionary for Linux. Press a key, type a word and get a clean popup with definitions, pronunciation, examples and etymology. It also works as a plain terminal command.
+A fast, offline English dictionary for Linux and macOS. Press a key, type a word and get a clean popup with definitions, pronunciation, examples and etymology. It also works as a plain terminal command, and on macOS as a [Raycast extension](raycast/).
 
 ![lexi showing "tesselate"](docs/screenshot.png)
 
@@ -34,6 +34,8 @@ lexi serendipity        # print the definition in the terminal
 lexi                    # ask for a word and show it in a popup
 lexi --open serendipity # open the popup for a word directly
 lexi update             # refresh the dictionaries from the latest Wiktionary dump
+lexi --json serendipity # the lookup as JSON, for integrations
+lexi --complete seren   # words starting with "seren", as JSON
 ```
 
 In the popup, scroll with the arrow keys or the mouse, search with `/` and close with `q` or `Esc`.
@@ -45,11 +47,15 @@ In the popup, scroll with the arrow keys or the mouse, search with `/` and close
 | Omarchy | ✓ | ✓ | ✓ |
 | Hyprland | ✓ | ✓ | ✓ |
 | Other Linux desktops | ✓ | ✓ (normal terminal window) | |
-| macOS | ✓ | | |
+| macOS | ✓ | ✓ with [Raycast](raycast/), or Terminal.app | Raycast |
 
-lexi asks for the word using the first of these it finds: `omarchy-menu-input`, `fuzzel`, `wofi`, `tofi`, `rofi`, `bemenu`, `zenity` or `kdialog`. If none is installed, it asks inside the popup.
+lexi asks for the word using the first of these it finds: `omarchy-menu-input`, `fuzzel`, `wofi`, `tofi`, `rofi`, `bemenu`, `zenity`, `kdialog` or, on macOS, a native dialog. If none is available, it asks inside the popup.
 
-The popup opens in the first available terminal: `foot`, `kitty`, `alacritty`, `ghostty`, `wezterm`, `xdg-terminal-exec`, `gnome-terminal`, `konsole` or `xterm`.
+The popup opens in the first available terminal: `foot`, `kitty`, `alacritty`, `ghostty`, `wezterm`, `xdg-terminal-exec`, `gnome-terminal`, `konsole` or `xterm`, and on macOS Terminal.app.
+
+### macOS and Raycast
+
+On macOS the nicest way to use lexi is the [Raycast extension](raycast/): words appear as you type, and the definition shows in Raycast's detail pane. It can also look up the word you have selected in any app. Install lexi with `./install.sh` first, then see [raycast/README.md](raycast/README.md).
 
 ## Configuration
 

@@ -16,7 +16,7 @@ rm -rf "$STATE_DIR"
 
 if [[ -f $bindings ]] && grep -q -- '-- lexi' "$bindings"; then
   cp "$bindings" "$bindings.bak.$(date +%s)"
-  sed -i -e '/^-- lexi: /d' -e '/-- lexi$/d' "$bindings"
+  grep -v -e '^-- lexi: ' -e '-- lexi$' "$bindings" >"$bindings.new" && mv "$bindings.new" "$bindings"
   hyprctl reload >/dev/null 2>&1 || true
   echo "Removed the keybinding from $bindings"
 fi
