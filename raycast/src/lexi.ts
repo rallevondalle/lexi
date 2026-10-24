@@ -16,12 +16,13 @@ export interface Sense {
 export interface Entry {
   word: string;
   pos: string | null;
+  forms?: string | null;
   senses: Sense[];
 }
 
 export interface Section {
   title: string;
-  kind: "main" | "reference" | "wordnet";
+  kind: "main" | "reference" | "wordnet" | "translation" | "foreign";
   ipa: string | null;
   entries: Entry[];
 }
@@ -109,7 +110,8 @@ function gloss(text: string): string {
 function entriesMarkdown(entries: Entry[]): string[] {
   const out: string[] = [];
   for (const entry of entries) {
-    out.push("", `**${(entry.pos ?? "").toUpperCase()}**`, "");
+    const forms = entry.forms ? `  ${escape(entry.forms)}` : "";
+    out.push("", `**${(entry.pos ?? "").toUpperCase()}**${forms}`, "");
     let num = 0;
     for (const sense of entry.senses) {
       if (sense.depth === 0) {
@@ -149,6 +151,9 @@ export function toMarkdown(result: LookupResult): string {
       } else {
         out.push("", "---", "", `#### ${section.title}`);
       }
+    }
+    if (section.kind === "translation" && !section.entries.length) {
+      out.push("", "*Wiktionary has no translation of this word.*");
     }
     out.push(...entriesMarkdown(section.entries));
   }

@@ -2,32 +2,46 @@
 """lexi - a fast, offline English dictionary for the terminal and a popup window.
 
 Definitions come from Wiktionary (via kaikki.org) and Open English WordNet.
+Any language Wiktionary has can be added for translations both ways.
 
   lexi WORD          print the definition in the terminal
   lexi               ask for a word and show it in a popup window
   lexi --open WORD   show WORD in the popup window
+  lexi settings      open the settings (languages, font size, width) in the popup
   lexi --json WORD   print the lookup as JSON (for integrations such as Raycast)
   lexi --complete P  print words starting with P as JSON
   lexi update        download the dictionaries and (re)build the database
+  lexi add LANG...   download dictionaries for languages, e.g. lexi add Danish Swedish
+  lexi remove LANG   remove a language's dictionary
+  lexi languages     list the installed languages (--all: every available language)
   lexi --help        show this help
+
+In the popup: type a word and press Enter to look it up, or click a word.
+← and → go back and forward, ↑ ↓ and the mouse wheel scroll, Ctrl+S opens
+the settings and Esc closes.
 """
+import codecs
 import difflib
+import glob
 import gzip
+import itertools
 import json
-import math
 import os
 import re
+import select
 import shlex
 import shutil
 import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 import time
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 APP_ID = "lexi.popup"
 
 
@@ -39,21 +53,32 @@ DATA_DIR = xdg("XDG_DATA_HOME", "~/.local/share")
 STATE_DIR = xdg("XDG_STATE_HOME", "~/.local/state")
 CONFIG_FILE = os.path.join(xdg("XDG_CONFIG_HOME", "~/.config"), "config")
 DB = os.environ.get("LEXI_DB", os.path.join(DATA_DIR, "lexi.db"))
+LANG_DIR = os.path.join(os.path.dirname(DB), "languages")
+LANG_INDEX = os.path.join(DATA_DIR, "languages.json")
 FIT_FILE = os.path.join(STATE_DIR, "cell")
+JOB_PID = os.path.join(STATE_DIR, "download.pid")
+JOB_LOG = os.path.join(STATE_DIR, "download.log")
+JOB_STATUS = os.path.join(STATE_DIR, "download.json")
 
-WIKTIONARY_URL = "https://kaikki.org/dictionary/English/kaikki.org-dictionary-English.jsonl.gz"
+KAIKKI = "https://kaikki.org/dictionary/"
+WIKTIONARY_URL = KAIKKI + "English/kaikki.org-dictionary-English.jsonl.gz"
 WORDNET_RELEASES = "https://api.github.com/repos/globalwordnet/english-wordnet/releases/latest"
 WORDNET_FALLBACK = ("https://github.com/globalwordnet/english-wordnet/releases/download/"
                     "2025-edition/english-wordnet-2025.xml.gz")
 
-WIKT, WORDNET = 0, 1
+# The main database holds WIKT and WORDNET; each language's database holds FOREIGN (its words with
+# English glosses) and EN_X (English words with their translations into it).
+WIKT, WORDNET, FOREIGN, EN_X = 0, 1, 2, 3
 
 
 # ---------- configuration ----------
 
+DEFAULTS = {"lang": "en", "font_size": "12", "width": "76", "wordnet": "on"}
+
+
 def load_config():
     """~/.config/lexi/config holds key = value lines; LEXI_* environment variables win."""
-    cfg = {"lang": "en", "font_size": "12", "width": "76"}
+    cfg = dict(DEFAULTS)
     try:
         with open(CONFIG_FILE) as f:
             for line in f:
@@ -68,10 +93,35 @@ def load_config():
     return cfg
 
 
+def save_config(key, value):
+    """Set one key in the config file, keeping the other lines and comments."""
+    CFG[key] = str(value)
+    try:
+        with open(CONFIG_FILE) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        lines = []
+    line = f"{key} = {value}"
+    for i, l in enumerate(lines):
+        if re.match(rf"^\s*{key}\s*=", l):
+            lines[i] = line
+            break
+    else:
+        lines.append(line)
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
 CFG = load_config()
 TEXT_WIDTH = max(40, int(CFG["width"]))
 FONT_SIZE = CFG["font_size"]
 MARGIN = 4  # empty columns on each side of the text in the popup
+
+
+def wordnet_on():
+    return CFG["wordnet"].lower() not in ("off", "no", "false", "0")
+
 
 STRINGS = {
     "en": {
@@ -81,27 +131,117 @@ STRINGS = {
         "did_you_mean": "Did you mean: ",
         "origin": "ORIGIN",
         "more": "↓ more",
-        "close": "q close",
-        "search": "/ search",
         "no_db": "The dictionary hasn't been built yet.",
         "run_update": "Run: lexi update",
+        "en_x": "English → {}",
+        "x_en": "{} → English",
+        "english": "English",
+        "hint": "type a word · ←→ back/forward · ^S settings · esc close",
+        "lookup": "Look up",
+        "settings": "Settings",
+        "interface": "Language in lexi",
+        "font_size": "Font size",
+        "next_time": "next time the popup opens",
+        "width": "Text width",
+        "wordnet": "WordNet definitions",
+        "on": "on",
+        "off": "off",
+        "dictionaries": "DICTIONARIES",
+        "always": "always",
+        "filter": "type to filter",
+        "installed": "installed",
+        "will_add": "↵ download",
+        "will_remove": "↵ remove",
+        "will_stop": "↵ stop",
+        "senses": "{}k senses",
+        "loading_list": "Fetching the list of languages…",
+        "offline_list": "Couldn't fetch the list of languages (offline?). Showing the installed ones.",
+        "settings_keys": "↑↓ move · space/←→ change · enter download · esc back",
+        "pending": "Enter carries out the marked changes. Esc again discards them.",
+        "started": "Downloading {} in the background (about 550 MB, a few minutes). You can close lexi.",
+        "stopped": "Stopped downloading {}.",
+        "removed": "Removed {}.",
+        "downloading": "Downloading",
+        "downloading_short": "downloading",
+        "indexing": "indexing",
+        "add_done": "{} is ready in lexi",
+        "add_failed": "Downloading {} failed. See {}",
+        "no_translation": "Wiktionary has no translation of this word.",
     },
     "da": {
-        "prompt": "Slå engelsk ord op",
+        "prompt": "Slå ord op",
         "not_found": "ikke fundet",
         "nothing": "Ingen forklaring fundet.",
         "did_you_mean": "Mente du: ",
         "origin": "OPRINDELSE",
         "more": "↓ mere",
-        "close": "q luk",
-        "search": "/ søg",
         "no_db": "Ordbogen er ikke bygget endnu.",
         "run_update": "Kør: lexi update",
+        "en_x": "Engelsk → {}",
+        "x_en": "{} → engelsk",
+        "english": "Engelsk",
+        "hint": "skriv et ord · ←→ tilbage/frem · ^S indstillinger · esc luk",
+        "lookup": "Slå op",
+        "settings": "Indstillinger",
+        "interface": "Sprog i lexi",
+        "font_size": "Skriftstørrelse",
+        "next_time": "næste gang popuppen åbner",
+        "width": "Tekstbredde",
+        "wordnet": "WordNet-definitioner",
+        "on": "til",
+        "off": "fra",
+        "dictionaries": "ORDBØGER",
+        "always": "altid",
+        "filter": "skriv for at filtrere",
+        "installed": "hentet",
+        "will_add": "↵ hent",
+        "will_remove": "↵ fjern",
+        "will_stop": "↵ stop",
+        "senses": "{}k betydninger",
+        "loading_list": "Henter listen over sprog…",
+        "offline_list": "Kunne ikke hente listen over sprog (offline?). Viser de hentede.",
+        "settings_keys": "↑↓ flyt · mellemrum/←→ skift · enter hent · esc tilbage",
+        "pending": "Enter udfører det markerede. Esc igen fortryder.",
+        "started": "Henter {} i baggrunden (ca. 550 MB, et par minutter). Du kan godt lukke lexi.",
+        "stopped": "Stoppede hentningen af {}.",
+        "removed": "Fjernede {}.",
+        "downloading": "Henter",
+        "downloading_short": "hentes",
+        "indexing": "indekseres",
+        "add_done": "{} er klar i lexi",
+        "add_failed": "Kunne ikke hente {}. Se {}",
+        "no_translation": "Wiktionary har ingen oversættelse af ordet.",
     },
 }
+INTERFACES = {"en": "English", "da": "Dansk"}
 T = STRINGS.get(CFG["lang"], STRINGS["en"])
 
-RESET, BOLD, DIM, ITALIC = "\033[0m", "\033[1m", "\033[2m", "\033[3m"
+# Language names as Danish writes them, for the Danish interface.
+DA_NAMES = {
+    "Danish": "dansk", "Swedish": "svensk", "Norwegian Bokmål": "norsk bokmål", "Norwegian Nynorsk": "nynorsk",
+    "Icelandic": "islandsk", "Faroese": "færøsk", "Finnish": "finsk", "German": "tysk", "Dutch": "nederlandsk",
+    "French": "fransk", "Spanish": "spansk", "Portuguese": "portugisisk", "Italian": "italiensk",
+    "Latin": "latin", "Ancient Greek": "oldgræsk", "Greek": "græsk", "Polish": "polsk", "Russian": "russisk",
+    "Ukrainian": "ukrainsk", "Czech": "tjekkisk", "Hungarian": "ungarsk", "Estonian": "estisk",
+    "Lithuanian": "litauisk", "Latvian": "lettisk", "Turkish": "tyrkisk", "Arabic": "arabisk",
+    "Hebrew": "hebraisk", "Persian": "persisk", "Hindi": "hindi", "Japanese": "japansk", "Chinese": "kinesisk",
+    "Mandarin": "mandarin", "Korean": "koreansk", "Vietnamese": "vietnamesisk", "Thai": "thai",
+    "Indonesian": "indonesisk", "Irish": "irsk", "Welsh": "walisisk", "Scottish Gaelic": "skotsk gælisk",
+    "Esperanto": "esperanto", "Romanian": "rumænsk", "Bulgarian": "bulgarsk", "Serbo-Croatian": "serbokroatisk",
+    "Slovak": "slovakisk", "Slovene": "slovensk", "Catalan": "catalansk", "Basque": "baskisk",
+    "Old Norse": "oldnordisk", "Old English": "oldengelsk", "Swahili": "swahili", "Greenlandic": "grønlandsk",
+}
+
+
+def lang_label(name):
+    return DA_NAMES.get(name, name) if T is STRINGS["da"] else name
+
+
+def capitalize(text):
+    return text[:1].upper() + text[1:]
+
+
+RESET, BOLD, DIM, ITALIC, REVERSE = "\033[0m", "\033[1m", "\033[2m", "\033[3m", "\033[7m"
 ACCENT, LABEL, TAG = "\033[1;34m", "\033[1;35m", "\033[33m"
 
 
@@ -128,10 +268,30 @@ def wrap(text, width, indent, hang, *codes, lead=None):
     return out
 
 
+def connect(path):
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def installed_languages():
+    """[{"code", "name", "path"}] for every downloaded language, by name."""
+    langs = []
+    for path in glob.glob(os.path.join(LANG_DIR, "*.db")):
+        try:
+            meta = dict(connect(path).execute("SELECT key, value FROM meta"))
+            langs.append({"code": meta["code"], "name": meta["name"], "path": path})
+        except (sqlite3.Error, KeyError):
+            continue
+    return sorted(langs, key=lambda l: l["name"])
+
+
 def fetch(db, key):
-    return db.execute(
-        "SELECT word, source, pos, ipa, etym, senses FROM entries WHERE key = ? ORDER BY source, rowid", (key,)
-    ).fetchall()
+    try:
+        return db.execute("SELECT word, source, pos, ipa, etym, senses, forms FROM entries "
+                          "WHERE key = ? ORDER BY source, rowid", (key,)).fetchall()
+    except sqlite3.OperationalError:
+        # Databases built by lexi 1.0 have no forms column.
+        return db.execute("SELECT word, source, pos, ipa, etym, senses, NULL FROM entries "
+                          "WHERE key = ? ORDER BY source, rowid", (key,)).fetchall()
 
 
 def suggestions(db, key, n=5):
@@ -154,15 +314,15 @@ REF = re.compile(
     r"^(?:\([^)]*\)\s*)?[^.;:()]{0,60}?\b(?:spelling|form|misspelling|participle|tense|past|plural|"
     r"singular|gerund|comparative|superlative|abbreviation|initialism|acronym|contraction|clipping|"
     r"ellipsis|variant|indicative|subjunctive|person|synonym) of (?P<target>[^.;:()“”]+?)\s*"
-    r"(?:\([^)]*\)|“[^”]*”)?\s*[.:]?$",
+    r"(?:\([^)]*\)|“[^”]*”)?\s*(?:\.|:.*)?$",
     re.I,
 )
 
 
-def references(db, entries, seen):
+def references(db, entries, seen, source=WIKT):
     """Words that entries refer to, with the parts of speech the references appear under."""
     found = {}
-    for _, _, pos, _, _, senses in entries:
+    for _, _, pos, _, _, senses, _ in entries:
         for _, gloss, _ in json.loads(senses):
             m = REF.match(gloss.strip())
             if not m:
@@ -170,17 +330,34 @@ def references(db, entries, seen):
             target = m.group("target").strip().strip("'\"").lower()
             if target in seen or len(target) > 40:
                 continue
-            if db.execute("SELECT 1 FROM entries WHERE key = ? AND source = 0 LIMIT 1", (target,)).fetchone():
+            if db.execute("SELECT 1 FROM entries WHERE key = ? AND source = ? LIMIT 1", (target, source)).fetchone():
                 found.setdefault(target, set()).add(pos)
     return list(found.items())[:3]
+
+
+def follow(db, first, seen, limit):
+    """The section first plus the words its entries refer to, e.g. "Alternative spelling of X"."""
+    source = first[2][0][1] if first[2] else WIKT
+    out, queue = [first], first[2]
+    while queue and len(out) < limit:
+        refs = references(db, queue, seen, source)
+        queue = []
+        for target, poses in refs:
+            seen.add(target)
+            trows = [r for r in fetch(db, target) if r[1] == source]
+            chosen = [r for r in trows if r[2] in poses] or trows
+            if chosen:
+                out.append((target, "reference", chosen))
+                queue += chosen
+    return out
 
 
 def collect(word):
     """Look word up and return the result as plain data (also what `lexi --json` prints).
 
     {"query", "found", "suggestions", "headword", "ipa",
-     "sections": [{"title", "kind": "main"|"reference"|"wordnet", "ipa",
-                   "entries": [{"word", "pos", "senses": [{"depth", "gloss", "example"}]}]}],
+     "sections": [{"title", "kind": "main"|"reference"|"wordnet"|"translation"|"foreign", "ipa",
+                   "entries": [{"word", "pos", "forms", "senses": [{"depth", "gloss", "example"}]}]}],
      "origins": [...]}
     """
     query = word.strip()
@@ -189,63 +366,77 @@ def collect(word):
     if not os.path.exists(DB):
         result["error"] = "no_db"
         return result
-    db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    main = connect(DB)
+    langs = [(l, connect(l["path"])) for l in installed_languages()]
+
+    def lookup(key):
+        # Databases from before languages had their own files may still hold Danish rows; skip them.
+        return ([r for r in fetch(main, key) if r[1] in (WIKT, WORDNET)],
+                [fetch(db, key) for _, db in langs])
+
     key = query.lower()
-    rows = fetch(db, key)
-    if not rows:
-        result["suggestions"] = suggestions(db, key)
+    main_rows, lang_rows = lookup(key)
+    if not main_rows and not any(lang_rows):
+        cands = [s for db in [main] + [db for _, db in langs] for s in suggestions(db, key)]
+        result["suggestions"] = difflib.get_close_matches(key, list(dict.fromkeys(cands)), n=5, cutoff=0.75)
         if not result["suggestions"]:
             return result
         key = query = result["suggestions"][0]
-        rows = fetch(db, key)
+        main_rows, lang_rows = lookup(key)
     result["found"] = True
 
     # The exact spelling (e.g. "free" before "Free") comes first.
-    rows.sort(key=lambda r: (r[1], r[0] != query))
-    result["headword"] = rows[0][0]
-    result["ipa"] = next((r[3] for r in rows if r[3]), None)
+    everything = sorted(main_rows, key=lambda r: (r[1], r[0] != query)) + [r for rows in lang_rows for r in rows]
+    result["headword"] = everything[0][0]
+    result["ipa"] = next((r[3] for r in everything if r[3]), None)
 
-    # Follow references such as "Alternative spelling of X" and merge X in below.
-    sections = [("Wiktionary", "main", [r for r in rows if r[1] == WIKT])]
     seen = {key}
-    queue = sections[0][2]
-    while queue and len(sections) < 4:
-        refs = references(db, queue, seen)
-        queue = []
-        for target, poses in refs:
-            seen.add(target)
-            trows = [r for r in fetch(db, target) if r[1] == WIKT]
-            chosen = [r for r in trows if r[2] in poses] or trows
-            if chosen:
-                sections.append((target, "reference", chosen))
-                queue += chosen
-    wordnet = [r for r in rows if r[1] == WORDNET]
-    if not wordnet:
-        for target, _, _ in sections[1:]:
-            wordnet = [r for r in fetch(db, target) if r[1] == WORDNET]
-            if wordnet:
+    english = follow(main, ("Wiktionary", "main", [r for r in sorted(main_rows, key=lambda r: r[0] != query)
+                                                    if r[1] == WIKT]), seen, 4)
+    wordnet = [r for r in main_rows if r[1] == WORDNET]
+    for target, _, _ in english[1:]:
+        wordnet = wordnet or [r for r in fetch(main, target) if r[1] == WORDNET]
+
+    sections = []
+    for (lang, db), rows in zip(langs, lang_rows):
+        name = lang_label(lang["name"])
+        title = capitalize(T["en_x"].format(name))
+        translations = [r for r in rows if r[1] == EN_X]
+        # "ran" has no translations of its own, so use those of "run".
+        for target, _, _ in english[1:]:
+            if translations:
                 break
-    if wordnet:
+            translations = [r for r in fetch(db, target) if r[1] == EN_X]
+            if translations:
+                title += ": " + target
+        sections.append((title, "translation", translations))
+        sections += follow(db, (capitalize(T["x_en"].format(name)), "foreign", [r for r in rows if r[1] == FOREIGN]),
+                           seen, 3)
+    sections += english
+    if wordnet and wordnet_on():
         sections.append(("WordNet", "wordnet", wordnet))
 
-    origins = []
+    origins, foreign_origins = [], []
     for title, kind, entries in sections:
-        if not entries:
+        if not entries and not (kind == "translation" and main_rows):
             continue
+        ipa = next((r[3] for r in entries if r[3]), None)
         result["sections"].append({
             "title": title,
             "kind": kind,
-            "ipa": next((r[3] for r in entries if r[3]), None) if kind == "reference" else None,
+            "ipa": ipa if kind == "reference" or (kind == "foreign" and ipa != result["ipa"]) else None,
             "entries": [
-                {"word": w, "pos": pos, "senses": [
+                {"word": w, "pos": pos, "forms": forms, "senses": [
                     {"depth": d, "gloss": unescape(g), "example": unescape(x) if x else None}
                     for d, g, x in json.loads(senses)
                 ]}
-                for w, _, pos, _, _, senses in entries
+                for w, _, pos, _, _, senses, forms in entries
             ],
         })
-        origins += [r[4] for r in entries if r[4]]
-    result["origins"] = list(dict.fromkeys(origins))[:3]
+        if kind != "translation":
+            (foreign_origins if entries and entries[0][1] == FOREIGN else origins).extend(r[4] for r in entries if r[4])
+    # Other languages' etymologies only when there is no English one, so "and" doesn't mix the two.
+    result["origins"] = list(dict.fromkeys(origins or foreign_origins))[:3]
     return result
 
 
@@ -253,7 +444,7 @@ def unescape(text):
     return re.sub(r"&?#(\d+);", lambda m: chr(int(m.group(1))), text)
 
 
-def render(word, width=TEXT_WIDTH):
+def render(word, width):
     """Return (lines, found) for word, styled for the terminal at the given text width."""
     data = collect(word)
     if data.get("error") == "no_db":
@@ -269,20 +460,27 @@ def render(word, width=TEXT_WIDTH):
     out.append(style(headword, ACCENT) + ("   " + style(data["ipa"], DIM) if data["ipa"] else ""))
     sections = data["sections"]
     for i, sec in enumerate(sections):
-        if len(sections) > 1:
-            ref = sec["kind"] == "reference"
+        if len(sections) > 1 or sec["kind"] in ("foreign", "translation"):
+            ref = sec["kind"] not in ("main", "wordnet")
             head = f" {sec['title']} "
             line = style("── ", DIM) + style(sec["title"], ACCENT if ref else DIM) + " "
             if sec["ipa"]:
                 line += style(sec["ipa"], DIM) + " "
                 head += sec["ipa"] + " "
             out += ["", line + style("─" * max(2, width - len(head) - 3), DIM)]
-        base = headword if i == 0 else sec["entries"][0]["word"]
+        if not sec["entries"]:
+            out += ["", style(T["no_translation"], DIM)]
+            continue
+        base = headword if sec["kind"] != "reference" else sec["entries"][0]["word"]
         for entry in sec["entries"]:
             label = (entry["pos"] or "").upper()
             if entry["word"].lower() == base.lower() and entry["word"] != base:
                 label += "  " + entry["word"]
-            out += ["", style(label, LABEL)]
+            out.append("")
+            if entry["forms"]:
+                out += wrap(entry["forms"], width, 0, len(label) + 2, DIM, lead=style(label, LABEL) + "  ")
+            else:
+                out.append(style(label, LABEL))
             num = sub = 0
             for sense in entry["senses"]:
                 if sense["depth"] == 0:
@@ -306,11 +504,11 @@ def render(word, width=TEXT_WIDTH):
 
 
 def complete(prefix, limit=30):
-    """Words starting with prefix, shortest first (for launchers such as Raycast)."""
+    """Words starting with prefix, English first and shortest first (for launchers such as Raycast)."""
     prefix = prefix.strip().lower()
     if not prefix or not os.path.exists(DB):
         return []
-    db = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    db = connect(DB)
     hi = prefix[:-1] + chr(ord(prefix[-1]) + 1)
     # Common words (in WordNet) and lowercase words before names and rare forms; then shortest first.
     words = [r[0] for r in db.execute(
@@ -320,6 +518,11 @@ def complete(prefix, limit=30):
                     length(key), key
            LIMIT ?""",
         (prefix, hi, limit))]
+    # Interleave the other languages' words, so "hyg" offers "hygge" as well as "hygiene".
+    lists = [words] + [[r[0] for r in connect(lang["path"]).execute(
+        "SELECT key FROM words WHERE key >= ? AND key < ? ORDER BY length(key), key LIMIT ?", (prefix, hi, limit))]
+        for lang in installed_languages()]
+    words = list(dict.fromkeys(w for group in itertools.zip_longest(*lists) for w in group if w))[:limit]
     return words or suggestions(db, prefix, n=10)
 
 
@@ -447,46 +650,519 @@ def fit_window(nlines):
             write_fit(cw, ch, nw - ncols * cw, nh - nrows * ch)
 
 
-def view(word):
-    if not word:
-        try:
-            word = input(f"\n  {T['prompt']}: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return
-        if not word:
-            return
-    lines, _ = render(word)
-    fit_window(len(lines))
-    cols, _ = shutil.get_terminal_size()
-    pad = " " * max(0, (cols - TEXT_WIDTH) // 2)
-    text = "\n" + "\n".join(pad + l for l in lines) + "\n"
-    if not shutil.which("less"):
-        print(text)
-        input()
-        return
-    prompt = pad + f"?e:{T['more']}  ·  .{T['close']}  ·  {T['search']}"
-    opts = ["-R", "-c", "-~", "-K", "-Ps" + prompt]
-    # macOS ships an old less, so only use options the installed version knows.
-    version = less_version()
-    if version >= 551:
-        opts += ["--mouse", "--wheel-lines=3"]
-    if version >= 600:
-        opts += ["--use-color", "--color=PK"]
-    if version >= 643:
-        opts.append("--lesskey-content=#command\n\\e quit\n")
-    subprocess.run(
-        ["less", *opts],
-        input=text, text=True,
-    )
+def plain(text):
+    return re.sub(r"\033\[[0-9;]*m", "", text)
 
 
-def less_version():
+KEYS = {"A": "up", "B": "down", "C": "right", "D": "left", "H": "home", "F": "end",
+        "1~": "home", "7~": "home", "4~": "end", "8~": "end", "5~": "pgup", "6~": "pgdn"}
+CONTROL = {"\r": "enter", "\n": "enter", "\x7f": "backspace", "\x08": "backspace", "\t": "tab",
+           "\x13": "settings", "\x03": "quit", "\x11": "quit", "\x15": "clear"}
+
+
+class Terminal:
+    """Raw keyboard and mouse input, and full-screen output, on the controlling terminal."""
+
+    def __enter__(self):
+        import termios
+        import tty
+        self.fd = sys.stdin.fileno()
+        self.saved = termios.tcgetattr(self.fd)
+        tty.setraw(self.fd)
+        self.buf = b""
+        self.decoder = codecs.getincrementaldecoder("utf-8")("ignore")
+        # Alternate screen, no cursor, no line wrapping, mouse clicks and wheel.
+        self.write("\033[?1049h\033[?25l\033[?7l\033[?1000h\033[?1006h")
+        return self
+
+    def __exit__(self, *exc):
+        import termios
+        self.write("\033[?1000l\033[?1006l\033[?7h\033[?25h\033[?1049l")
+        termios.tcsetattr(self.fd, termios.TCSADRAIN, self.saved)
+
+    def write(self, text):
+        sys.stdout.write(text)
+        sys.stdout.flush()
+
+    def _more(self, timeout):
+        if select.select([self.fd], [], [], timeout)[0]:
+            data = os.read(self.fd, 4096)
+            self.buf += data
+            return bool(data)
+        return False
+
+    def key(self, timeout):
+        """The next key ("up", "enter", a character, ("mouse", button, x, y)…), or None after timeout."""
+        if not self.buf and not self._more(timeout):
+            return None
+        b = self.buf
+        if b[:1] == b"\033":
+            if len(b) == 1 and not self._more(0.03):
+                self.buf = b""
+                return "esc"
+            b = self.buf
+            m = re.match(rb"\033\[<(\d+);(\d+);(\d+)([Mm])", b)
+            if m:
+                self.buf = b[m.end():]
+                return ("mouse", int(m.group(1)), int(m.group(2)), int(m.group(3)), m.group(4) == b"M")
+            m = re.match(rb"\033[\[O]([\d;]*)([A-Za-z~])", b)
+            if m:
+                self.buf = b[m.end():]
+                params, final = m.group(1).decode(), m.group(2).decode()
+                name = KEYS.get(final) or KEYS.get(params.split(";")[0] + final)
+                if name in ("left", "right") and params.endswith((";3", ";9")):
+                    name = "alt-" + name
+                return name
+            if len(b) > 1 and b[1:2] not in (b"[", b"O"):
+                self.buf = b[2:]  # Alt+key: ignore
+                return None
+            if not self._more(0.05):
+                self.buf = b""
+            return None
+        # A character, possibly several UTF-8 bytes long.
+        n = 1 if b[0] < 0xC0 else 2 if b[0] < 0xE0 else 3 if b[0] < 0xF0 else 4
+        if len(b) < n and not self._more(0.05):
+            self.buf = b""
+            return None
+        ch, self.buf = self.decoder.decode(self.buf[:n]), self.buf[n:]
+        if ch in CONTROL:
+            return CONTROL[ch]
+        return ch if ch and ch.isprintable() else None
+
+
+class Popup:
+    """The popup: a word's entry, a line to type the next word, and the settings."""
+
+    def __init__(self, word, settings=False):
+        self.history, self.pos = [], -1
+        self.lines, self.top, self.input = [], 0, ""
+        self.mode = "settings" if settings else "view"
+        self.settings = Settings(self)
+        self.word = None
+        self.word_arg = word
+
+    def run(self):
+        with Terminal() as self.term:
+            if self.word_arg:
+                self.open(self.word_arg)
+            else:
+                fit_window(len(self.lines) or 6)
+            if self.mode == "settings":
+                self.settings.enter()
+            size = None
+            while True:
+                if shutil.get_terminal_size() != size:
+                    size = shutil.get_terminal_size()
+                    if self.word:
+                        self.lines = render(self.word, self.width())[0]
+                self.draw()
+                key = self.term.key(1)
+                if key is None:
+                    continue
+                handler = self.settings.handle if self.mode == "settings" else self.handle
+                if handler(key) == "quit":
+                    return
+
+    def width(self):
+        return max(30, min(TEXT_WIDTH, shutil.get_terminal_size().columns - 2))
+
+    def pad(self):
+        return max(1, (shutil.get_terminal_size().columns - self.width()) // 2)
+
+    def open(self, word, push=True):
+        self.word = word
+        self.lines, self.top, self.input = render(word, self.width())[0], 0, ""
+        if push:
+            self.history = self.history[:self.pos + 1] + [word]
+            self.pos += 1
+        fit_window(len(self.lines))
+
+    def draw(self):
+        cols, rows = shutil.get_terminal_size()
+        lines, status = (self.settings.view(rows) if self.mode == "settings" else self.view(rows))
+        out = []
+        for i in range(rows - 1):
+            out.append(f"\033[{i + 1};1H\033[2K" + (lines[i] if i < len(lines) else ""))
+        out.append(f"\033[{rows};1H\033[2K" + status)
+        self.term.write("".join(out))
+
+    def body(self):
+        return shutil.get_terminal_size().lines - 2  # a blank first row, and the status line
+
+    def view(self, rows):
+        pad = " " * self.pad()
+        lines = [""] + [pad + l for l in self.lines[self.top:self.top + self.body()]]
+        if self.input or not self.lines:
+            hints = complete(self.input, 5) if self.input else []
+            hints = [h for h in hints if h != self.input.lower()][:4]
+            status = (style(T["lookup"] + ": ", DIM) + self.input + style(" ", REVERSE)
+                      + style("   " + "  ".join(hints), DIM))
+        else:
+            more = self.top + self.body() < len(self.lines)
+            status = style(T["hint"], DIM) + (style("   " + T["more"], ACCENT) if more else "")
+        return lines, pad + status
+
+    def scroll(self, n):
+        self.top = max(0, min(self.top + n, len(self.lines) - self.body()))
+
+    def handle(self, key):
+        page = max(1, self.body() - 1)
+        if isinstance(key, tuple):
+            _, button, x, y, press = key
+            if button == 64:
+                self.scroll(-3)
+            elif button == 65:
+                self.scroll(3)
+            elif button == 0 and press:
+                word = self.word_at(x - 1, y - 2)
+                if word:
+                    self.open(word)
+        elif key == "quit":
+            return "quit"
+        elif key == "esc":
+            if not self.input:
+                return "quit"
+            self.input = ""
+        elif key == "enter":
+            if self.input.strip():
+                self.open(self.input.strip())
+        elif key == "backspace":
+            self.input = self.input[:-1]
+        elif key == "clear":
+            self.input = ""
+        elif key == "tab":
+            hints = complete(self.input, 2) if self.input else []
+            hints = [h for h in hints if h != self.input.lower()]
+            if hints:
+                self.input = hints[0]
+        elif key == "settings":
+            self.settings.enter()
+        elif key in ("left", "alt-left") and not self.input and self.pos > 0:
+            self.pos -= 1
+            self.open(self.history[self.pos], push=False)
+        elif key in ("right", "alt-right") and not self.input and self.pos < len(self.history) - 1:
+            self.pos += 1
+            self.open(self.history[self.pos], push=False)
+        elif key == "up":
+            self.scroll(-1)
+        elif key == "down":
+            self.scroll(1)
+        elif key == "pgup":
+            self.scroll(-page)
+        elif key == "pgdn":
+            self.scroll(page)
+        elif key == "home":
+            self.top = 0
+        elif key == "end":
+            self.scroll(len(self.lines))
+        elif key == " " and not self.input:
+            self.scroll(page)
+        elif len(key) == 1:
+            self.input += key
+        return None
+
+    def word_at(self, col, row):
+        """The word shown at a screen position (0-based, relative to the text area)."""
+        i = self.top + row
+        if row < 0 or i >= len(self.lines):
+            return None
+        text, col = plain(self.lines[i]), col - self.pad()
+        for m in re.finditer(r"[\w'’-]+", text):
+            if m.start() <= col < m.end():
+                word = m.group().strip("'’-")
+                return word if len(word) > 1 and not word.isdigit() else None
+        return None
+
+
+# ---------- settings ----------
+
+def job_pid():
+    """The pid of the running download, or None."""
     try:
-        out = subprocess.run(["less", "--version"], capture_output=True, text=True).stdout
-        return int(re.search(r"less (\d+)", out).group(1))
-    except (OSError, AttributeError, ValueError):
-        return 0
+        with open(JOB_PID) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        # Reap it if this popup started it and it has finished, so it doesn't linger as a zombie.
+        if os.waitpid(pid, os.WNOHANG)[0] == pid:
+            return None
+    except ChildProcessError:
+        pass
+    try:
+        os.kill(pid, 0)
+        return pid
+    except OSError:
+        return None
 
+
+def job_running():
+    return job_pid() is not None
+
+
+def stop_job():
+    """Stop the running download and remove its half-built files."""
+    import signal
+    pid = job_pid()
+    if pid:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+        except OSError:
+            try:
+                os.kill(pid, signal.SIGTERM)  # `lexi add` run from a shell isn't a group leader
+            except OSError:
+                pass
+        for _ in range(20):
+            if not job_running():
+                break
+            time.sleep(0.1)
+    for path in [JOB_PID, JOB_STATUS] + glob.glob(os.path.join(LANG_DIR, "*.db.new")):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def job_progress():
+    """{"names", "pct", "phase"} of the running download, or None."""
+    if not job_running():
+        return None
+    try:
+        with open(JOB_STATUS) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def job_status():
+    """The download's final line once it has finished recently (its progress shows in the rows)."""
+    try:
+        with open(JOB_LOG, errors="replace") as f:
+            text = f.read()
+        recent = time.time() - os.path.getmtime(JOB_LOG) < 600
+    except OSError:
+        return None
+    parts = [p.strip() for p in re.split(r"[\r\n]", text) if p.strip()]
+    if not parts or job_running() or not recent:
+        return None
+    return parts[-1]
+
+
+def start_job(names):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    log = open(JOB_LOG, "w")
+    proc = subprocess.Popen([sys.executable, os.path.abspath(__file__), "add", *names],
+                            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    with open(JOB_PID, "w") as f:
+        f.write(str(proc.pid))
+
+
+BAR = 14  # width of the progress bar behind "downloading"
+
+
+def progress_bar(progress):
+    """ "downloading" on a bar that fills from the left, then the percentage."""
+    label = T["indexing"] if progress["phase"] == "indexing" else T["downloading_short"]
+    text = f" {label}".ljust(BAR)[:BAR]
+    fill = round(BAR * progress["pct"] / 100)
+    return style(text[:fill], REVERSE, "\033[34m") + style(text[fill:], ACCENT) + style(f"{progress['pct']:>4}%", ACCENT)
+
+
+class Settings:
+    """Settings page: interface language, font size, width, WordNet and which languages are downloaded."""
+
+    FIXED = ["lang", "font_size", "width", "wordnet"]
+
+    def __init__(self, popup):
+        self.popup = popup
+        self.cursor, self.filter, self.pending, self.message = 0, "", {}, ""
+        self.index, self.index_failed, self.confirm = None, False, False
+        self.top = 0
+
+    def enter(self):
+        self.popup.mode = "settings"
+        self.cursor, self.filter, self.message, self.confirm = 0, "", "", False
+        if self.index is None:
+            threading.Thread(target=self.load_index, daemon=True).start()
+        fit_window(30)
+
+    def load_index(self):
+        self.index = language_index()
+        self.index_failed = not self.index
+
+    def leave(self):
+        self.popup.mode = "view"
+        self.pending.clear()
+        if self.popup.word:
+            self.popup.open(self.popup.word, push=False)
+        else:
+            fit_window(6)
+
+    def items(self):
+        installed = {l["name"] for l in installed_languages()}
+        progress = job_progress()
+        coming = [n for n in (progress or {}).get("names", []) if n not in installed]
+        names = sorted(installed) + coming + [l["name"] for l in self.index or []
+                                              if l["name"] not in installed and l["name"] not in coming]
+        senses = {l["name"]: l["senses"] for l in self.index or []}
+        if self.filter:
+            f = self.filter.lower()
+            names = [n for n in names if f in n.lower() or f in DA_NAMES.get(n, "").lower()]
+        return [("setting", k) for k in self.FIXED] + [("lang", n, n in installed, senses.get(n)) for n in names]
+
+    def value(self, key):
+        if key == "lang":
+            return INTERFACES.get(CFG["lang"], CFG["lang"])
+        if key == "wordnet":
+            return T["on"] if wordnet_on() else T["off"]
+        return CFG[key]
+
+    def view(self, rows):
+        pad = " " * self.popup.pad()
+        width = self.popup.width()
+        items = self.items()
+        self.cursor = min(self.cursor, len(items) - 1)
+        out, cursor_line = ["", style("lexi · " + T["settings"], ACCENT), ""], 0
+        progress = job_progress()
+        progress_names = set(progress["names"]) if progress else set()
+        for i, item in enumerate(items):
+            if item[0] == "setting":
+                key = item[1]
+                label = T["interface"] if key == "lang" else T[key]
+                text = f"{label:<24}◀ {self.value(key)} ▶"
+                extra = style("   " + T["next_time"], DIM) if key == "font_size" else ""
+            else:
+                if i == len(self.FIXED):
+                    filt = (self.filter + style(" ", REVERSE)) if self.filter else style(T["filter"], DIM)
+                    out += ["", style(T["dictionaries"], LABEL) + "   " + filt, ""]
+                    status = job_status()
+                    if status:
+                        out += [style(status, ACCENT)[:width + 20], ""]
+                    out.append("   " + f"[x] {T['english']}" + style(f"   {T['always']}", DIM))
+                _, name, installed, senses = item
+                action = self.pending.get(name)
+                checked = (installed or name in progress_names) != (action is not None)
+                shown = name + (f" · {DA_NAMES[name]}" if T is STRINGS["da"] and name in DA_NAMES else "")
+                text = f"[{'x' if checked else ' '}] {shown}"
+                note = (T["will_add"] if action == "add" else T["will_remove"] if action == "remove"
+                        else T["will_stop"] if action == "stop"
+                        else T["installed"] if installed else T["senses"].format(max(1, round(senses / 1000)))
+                        if senses else "")
+                extra = style(" " * max(2, width - 8 - len(text) - len(note)) + note,
+                              ACCENT if action else DIM)
+                if name in progress_names and not action:
+                    extra = " " * max(2, width - 8 - len(text) - BAR - 5) + progress_bar(progress)
+            if i == self.cursor:
+                cursor_line = len(out)
+            out.append(("  " + style(" " + text + " ", REVERSE) if i == self.cursor else "   " + text + " ") + extra)
+        if len(items) == len(self.FIXED):
+            out += ["", style(T["dictionaries"], LABEL) + "   " + (self.filter + style(" ", REVERSE)
+                                                              if self.filter else style(T["filter"], DIM))]
+        if self.index is None:
+            out += ["", style(T["loading_list"], DIM)]
+        elif self.index_failed:
+            out += ["", style(T["offline_list"], DIM)]
+        if self.message:
+            out = out[:3] + [style(m, ACCENT) for m in textwrap.wrap(self.message, width)] + [""] + out[3:]
+            cursor_line += len(textwrap.wrap(self.message, width)) + 1
+        body = rows - 1
+        if cursor_line < self.top + 3:
+            self.top = max(0, cursor_line - 3)
+        elif cursor_line >= self.top + body - 2:
+            self.top = cursor_line - body + 3
+        return [pad + l for l in out[self.top:self.top + body]], pad + style(T["settings_keys"], DIM)
+
+    def change(self, key, step):
+        global T, TEXT_WIDTH
+        if key == "lang":
+            codes = list(INTERFACES)
+            code = codes[(codes.index(CFG["lang"]) + step) % len(codes)] if CFG["lang"] in codes else "en"
+            save_config("lang", code)
+            T = STRINGS[code]
+        elif key == "font_size":
+            save_config("font_size", min(32, max(6, int(CFG["font_size"]) + step)))
+        elif key == "width":
+            TEXT_WIDTH = min(140, max(40, TEXT_WIDTH + 4 * step))
+            save_config("width", TEXT_WIDTH)
+            fit_window(30)
+        elif key == "wordnet":
+            save_config("wordnet", "off" if wordnet_on() else "on")
+
+    def toggle(self, name, installed):
+        downloading = set((job_progress() or {}).get("names", []))
+        if name in self.pending:
+            del self.pending[name]
+        elif name in downloading:
+            self.pending[name] = "stop"
+        else:
+            self.pending[name] = "remove" if installed else "add"
+        self.confirm = False
+
+    def apply(self):
+        pick = lambda action: [n for n, a in self.pending.items() if a == action]
+        removes, adds, stops = pick("remove"), pick("add"), pick("stop")
+        messages = []
+        for name in removes:
+            remove_language(name)
+            messages.append(T["removed"].format(name))
+        if adds or stops:
+            # Languages share the English download, so a change restarts it with the new set.
+            running = [n for n in (job_progress() or {}).get("names", []) if n not in stops]
+            stop_job()
+            if stops:
+                messages.append(T["stopped"].format(", ".join(stops)))
+            names = list(dict.fromkeys(running + adds))
+            if names:
+                start_job(names)
+                messages.append(T["started"].format(", ".join(names)))
+        self.pending.clear()
+        self.message = " ".join(messages)
+
+    def handle(self, key):
+        items = self.items()
+        item = items[min(self.cursor, len(items) - 1)]
+        if key == "quit":
+            return "quit"
+        if isinstance(key, tuple):
+            if key[1] in (64, 65):
+                self.cursor = max(0, min(len(items) - 1, self.cursor + (1 if key[1] == 65 else -1)))
+            return None
+        if key == "esc":
+            if self.filter:
+                self.filter = ""
+            elif self.pending and not self.confirm:
+                self.message, self.confirm = T["pending"], True
+            else:
+                self.leave()
+        elif key == "settings":
+            self.leave()
+        elif key == "up":
+            self.cursor = max(0, self.cursor - 1)
+        elif key == "down":
+            self.cursor = min(len(items) - 1, self.cursor + 1)
+        elif key in ("pgup", "pgdn"):
+            step = max(1, self.popup.body() - 4)
+            self.cursor = max(0, min(len(items) - 1, self.cursor + (step if key == "pgdn" else -step)))
+        elif key in ("left", "right", " "):
+            if item[0] == "setting":
+                self.change(item[1], -1 if key == "left" else 1)
+            else:
+                self.toggle(item[1], item[2])
+        elif key == "enter":
+            if self.pending:
+                self.apply()
+        elif key == "backspace":
+            self.filter = self.filter[:-1]
+        elif key == "clear":
+            self.filter = ""
+        elif isinstance(key, str) and len(key) == 1:
+            self.filter += key
+            self.cursor = len(self.FIXED)
+            self.top = 0
+        return None
+
+
+# ---------- launching ----------
 
 def ask_word():
     """Ask for a word with whatever launcher the desktop has. None means: ask inside the terminal."""
@@ -550,15 +1226,18 @@ def foot_font():
     return "monospace"
 
 
-def launch(word=None):
-    if not word:
+def launch(word=None, settings=False):
+    if not word and not settings:
         word = ask_word()
         if word == "":
             return  # the user cancelled
-    lines, _ = render(word) if word else ([], False)
-    presize(len(lines) if word else 6)
+    if settings:
+        presize(30)
+    else:
+        presize(len(render(word, TEXT_WIDTH)[0]) if word else 6)
     me = os.path.abspath(__file__)
-    cmd = terminal_command(f"lexi: {word or ''}".strip(), [sys.executable, me, "--view", *([word] if word else [])])
+    args = ["--settings"] if settings else ([word] if word else [])
+    cmd = terminal_command(f"lexi: {word or ''}".strip(), [sys.executable, me, "--view", *args])
     if not cmd:
         sys.exit("lexi: no terminal emulator found (set LEXI_TERMINAL)")
     if shutil.which("uwsm-app"):
@@ -567,13 +1246,52 @@ def launch(word=None):
                      stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-# ---------- building the database ----------
+# ---------- building the databases ----------
+
+class Tracker:
+    """Overall progress of a background download, written to JOB_STATUS for the settings page."""
+
+    def __init__(self, names, urls):
+        self.names, self.base, self.current, self.pct = names, 0, 0, -1
+        self.total = sum(remote_size(u) for u in urls) or 1
+        self.write(0)
+
+    def start(self):
+        self.base += self.current
+        self.current = 0
+
+    def update(self, done):
+        self.current = done
+        pct = min(99, (self.base + done) * 100 // self.total)
+        if pct != self.pct:
+            self.write(pct)
+
+    def write(self, pct, phase="download"):
+        self.pct = pct
+        with open(JOB_STATUS + ".new", "w") as f:
+            json.dump({"names": self.names, "pct": pct, "phase": phase}, f)
+        os.replace(JOB_STATUS + ".new", JOB_STATUS)
+
+
+TRACKER = None
+
+
+def remote_size(url):
+    try:
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": f"lexi/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return int(r.headers.get("Content-Length") or 0)
+    except (OSError, ValueError):
+        return 0
+
 
 def download(url, label):
-    """Stream url, reporting progress on stderr."""
+    """Stream url, reporting progress on stderr (and to TRACKER when set)."""
     req = urllib.request.Request(url, headers={"User-Agent": f"lexi/{VERSION}"})
     resp = urllib.request.urlopen(req, timeout=60)
     total = int(resp.headers.get("Content-Length") or 0)
+    if TRACKER:
+        TRACKER.start()
 
     class Progress:
         def __init__(self):
@@ -582,6 +1300,8 @@ def download(url, label):
         def read(self, n=-1):
             chunk = resp.read(n)
             self.done += len(chunk)
+            if TRACKER:
+                TRACKER.update(self.done)
             if total:
                 pct = self.done * 100 // total
                 if pct != self.shown:
@@ -590,6 +1310,48 @@ def download(url, label):
             return chunk
 
     return Progress()
+
+
+def language_index(max_age=7 * 86400):
+    """[{"name", "dir", "senses"}] for every language on kaikki.org, cached for a week."""
+    try:
+        if time.time() - os.path.getmtime(LANG_INDEX) < max_age:
+            with open(LANG_INDEX) as f:
+                return json.load(f)
+    except (OSError, ValueError):
+        pass
+    try:
+        req = urllib.request.Request(KAIKKI, headers={"User-Agent": f"lexi/{VERSION}"})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            html = r.read().decode("utf-8", "replace")
+        langs = [{"name": name, "dir": d, "senses": int(n)}
+                 for d, name, n in re.findall(r'<a href="([^"/]+)/index\.html">([^<]+?) \((\d+) senses\)</a>', html)
+                 if name not in ("English", "All languages combined")]
+        if langs:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with open(LANG_INDEX, "w") as f:
+                json.dump(langs, f)
+            return langs
+    except (OSError, ValueError):
+        pass
+    try:
+        with open(LANG_INDEX) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return []
+
+
+def resolve_language(name):
+    """The language index entry for a name as typed ("danish", "dansk", "Norwegian Bokmål")."""
+    n = name.strip().lower()
+    for lang in language_index():
+        if n in (lang["name"].lower(), DA_NAMES.get(lang["name"], "").lower()):
+            return lang
+    return None
+
+
+def dump_url(lang):
+    return f"{KAIKKI}{lang['dir']}/kaikki.org-dictionary-{urllib.parse.quote(lang['name'].replace(' ', ''))}.jsonl.gz"
 
 
 def clean_etymology(text):
@@ -604,35 +1366,137 @@ def clean_etymology(text):
     return lines[0][:500] if lines else None
 
 
-def wiktionary_rows(stream):
+def parse_senses(e):
+    """A Wiktextract entry's senses as [depth, gloss, example] lists."""
+    senses, last_parent = [], None
+    for s in e.get("senses", []):
+        if "no-gloss" in (s.get("tags") or []):
+            continue
+        glosses = s.get("raw_glosses") or s.get("glosses")
+        if not glosses:
+            continue
+        if len(glosses) > 1 and glosses[0] != last_parent:
+            senses.append([0, glosses[0], None])
+        last_parent = glosses[0]
+        example = next(
+            (x["text"] for x in s.get("examples", []) if x.get("text") and len(x["text"]) <= 220), None
+        )
+        senses.append([min(len(glosses) - 1, 1), glosses[-1], example])
+    return senses
+
+
+def parse_ipa(e):
+    ipa = []
+    for snd in e.get("sounds", []):
+        if snd.get("ipa") and snd["ipa"] not in ipa:
+            ipa.append(snd["ipa"])
+        if len(ipa) == 2:
+            break
+    return " ".join(ipa) or None
+
+
+GENDERS = (("masculine", "m"), ("feminine", "f"), ("neuter", "n"), ("common-gender", "c"))
+
+
+def with_gender(word, tags, code):
+    """A noun with its gender: "en hund" in Danish, "Hund m" in other languages."""
+    tags = tags or []
+    if code == "da":
+        if "common-gender" in tags and "neuter" not in tags:
+            return "en " + word
+        if "neuter" in tags and "common-gender" not in tags:
+            return "et " + word
+        return word
+    genders = [g for tag, g in GENDERS if tag in tags]
+    return word + (" " + "/".join(genders) if genders else "")
+
+
+def translations(e, codes):
+    """The translations in an English entry into each language in codes, as senses grouped by meaning."""
+    groups = {}
+    for t in e.get("translations", []) + [t for s in e.get("senses", []) for t in s.get("translations", [])]:
+        code = t.get("lang_code")
+        if code not in codes or not t.get("word"):
+            continue
+        words = groups.setdefault(code, {}).setdefault((t.get("sense") or "").strip(), [])
+        word = with_gender(t["word"], t.get("tags"), code)
+        if word not in words and len(words) < 8:
+            words.append(word)
+    return {code: [[0, (f"({sense}) " if sense else "") + ", ".join(words), None] for sense, words in g.items()]
+            for code, g in groups.items()}
+
+
+def english_rows(stream, main, langs):
+    """(target, row) for the English dump: target None for the main database, else a language code.
+
+    Words without a translation table get the words whose English gloss is this word (lang["inverse"]).
+    """
+    codes = {lang["code"] for lang in langs}
     for line in gzip.open(stream, "rt", encoding="utf-8"):
         e = json.loads(line)
         if e.get("lang_code") != "en" or not e.get("word"):
             continue
-        senses, last_parent = [], None
-        for s in e.get("senses", []):
-            if "no-gloss" in (s.get("tags") or []):
-                continue
-            glosses = s.get("raw_glosses") or s.get("glosses")
-            if not glosses:
-                continue
-            if len(glosses) > 1 and glosses[0] != last_parent:
-                senses.append([0, glosses[0], None])
-            last_parent = glosses[0]
-            example = next(
-                (x["text"] for x in s.get("examples", []) if x.get("text") and len(x["text"]) <= 220), None
-            )
-            senses.append([min(len(glosses) - 1, 1), glosses[-1], example])
+        key, pos = e["word"].lower(), e.get("pos")
+        if langs:
+            trans = translations(e, codes)
+            for lang in langs:
+                senses = trans.get(lang["code"])
+                if not senses and e["word"] == key and (key, pos) in lang["inverse"]:
+                    senses = [[0, ", ".join(lang["inverse"][(key, pos)]), None]]
+                if senses:
+                    yield lang["code"], (key, e["word"], EN_X, pos, None, None,
+                                         json.dumps(senses, ensure_ascii=False), None)
+        if main:
+            senses = parse_senses(e)
+            if senses:
+                yield None, (key, e["word"], WIKT, pos, parse_ipa(e), clean_etymology(e.get("etymology_text")),
+                             json.dumps(senses, ensure_ascii=False), None)
+
+
+def head_forms(e, code):
+    """The headword line, e.g. "en hund (singular definite hunden, plural indefinite hunde)"."""
+    head = next((h.get("expansion") for h in e.get("head_templates", []) if h.get("expansion")), "")
+    word = e["word"]
+    if not head.startswith(word):
+        return None
+    if code == "da":
+        m = re.match(r"^ ([cn])\b\s*(.+)$", head[len(word):])
+        if m:
+            head = ("en " if m.group(1) == "c" else "et ") + word + " " + m.group(2)
+        return head if head.startswith(("en ", "et ")) or "(" in head else None
+    return head if "(" in head or len(head) > len(word) + 2 else None
+
+
+def foreign_rows(stream, lang):
+    """A language's entries with English glosses; sets lang["code"] and fills lang["inverse"]."""
+    inverse = lang["inverse"]
+    for line in gzip.open(stream, "rt", encoding="utf-8"):
+        e = json.loads(line)
+        if not e.get("word") or not e.get("lang_code"):
+            continue
+        lang["code"] = lang["code"] or e["lang_code"]
+        if e["lang_code"] != lang["code"]:
+            continue
+        senses = parse_senses(e)
         if not senses:
             continue
-        ipa = []
-        for snd in e.get("sounds", []):
-            if snd.get("ipa") and snd["ipa"] not in ipa:
-                ipa.append(snd["ipa"])
-            if len(ipa) == 2:
-                break
-        yield (e["word"].lower(), e["word"], WIKT, e.get("pos"), " ".join(ipa) or None,
-               clean_etymology(e.get("etymology_text")), json.dumps(senses, ensure_ascii=False))
+        pos = e.get("pos")
+        for s in e.get("senses", []):
+            tags = s.get("tags") or []
+            if "form-of" in tags or not s.get("glosses"):
+                continue
+            gloss = re.sub(r"\([^)]*\)", "", s["glosses"][-1])
+            for part in re.split(r"[,;]", gloss):
+                part = part.strip().lower()
+                if pos == "verb" and part.startswith("to "):
+                    part = part[3:]
+                if part and len(part.split()) <= 2:
+                    words = inverse.setdefault((part, pos), [])
+                    word = with_gender(e["word"], tags, lang["code"]) if pos == "noun" else e["word"]
+                    if word not in words and len(words) < 8:
+                        words.append(word)
+        yield (e["word"].lower(), e["word"], FOREIGN, pos, parse_ipa(e), clean_etymology(e.get("etymology_text")),
+               json.dumps(senses, ensure_ascii=False), head_forms(e, lang["code"]))
 
 
 WN_POS = {"n": "noun", "v": "verb", "a": "adj", "s": "adj", "r": "adv"}
@@ -669,7 +1533,7 @@ def wordnet_rows(stream):
             senses.append([0, gloss, s["ex"][0] if s["ex"] else None])
         if senses:
             yield (word.lower(), word, WORDNET, WN_POS.get(pos, pos), None, None,
-                   json.dumps(senses, ensure_ascii=False))
+                   json.dumps(senses, ensure_ascii=False), None)
 
 
 def wordnet_url():
@@ -684,31 +1548,22 @@ def wordnet_url():
     return WORDNET_FALLBACK
 
 
-def update():
-    os.makedirs(DATA_DIR, exist_ok=True)
-    tmp = DB + ".new"
-    if os.path.exists(tmp):
-        os.remove(tmp)
-    db = sqlite3.connect(tmp)
+def new_db(path):
+    if os.path.exists(path):
+        os.remove(path)
+    db = sqlite3.connect(path)
     db.executescript("""
         PRAGMA journal_mode = OFF;
         PRAGMA synchronous = OFF;
-        CREATE TABLE entries (key TEXT, word TEXT, source INT, pos TEXT, ipa TEXT, etym TEXT, senses TEXT);
+        CREATE TABLE entries (key TEXT, word TEXT, source INT, pos TEXT, ipa TEXT, etym TEXT, senses TEXT,
+                              forms TEXT);
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
     """)
-    print("Building the lexi dictionary. This downloads about 540 MB and takes a few minutes.", file=sys.stderr)
-    sources = (("Open English WordNet", wordnet_url(), wordnet_rows),
-               ("Wiktionary", WIKTIONARY_URL, wiktionary_rows))
-    for label, url, rows in sources:
-        n, batch = 0, []
-        for row in rows(download(url, label)):
-            batch.append(row)
-            n += 1
-            if len(batch) == 20000:
-                db.executemany("INSERT INTO entries VALUES (?,?,?,?,?,?,?)", batch)
-                batch.clear()
-        db.executemany("INSERT INTO entries VALUES (?,?,?,?,?,?,?)", batch)
-        print(f"\r  {label}: {n:,} entries" + " " * 20, file=sys.stderr)
-    print("  Indexing…", file=sys.stderr)
+    return db
+
+
+def finish_db(db, tmp, path, meta):
+    db.executemany("INSERT INTO meta VALUES (?, ?)", meta.items())
     db.executescript("""
         CREATE INDEX entries_key ON entries (key);
         CREATE TABLE words AS SELECT DISTINCT key FROM entries;
@@ -716,8 +1571,128 @@ def update():
         VACUUM;
     """)
     db.close()
-    os.replace(tmp, DB)
-    print(f"Done: {DB} ({os.path.getsize(DB) / 1e6:.0f} MB)", file=sys.stderr)
+    os.replace(tmp, path)
+    print(f"  {meta.get('name', 'English')}: {path} ({os.path.getsize(path) / 1e6:.0f} MB)", file=sys.stderr)
+
+
+class Inserter:
+    def __init__(self, db):
+        self.db, self.batch, self.n = db, [], 0
+
+    def add(self, row):
+        self.batch.append(row)
+        self.n += 1
+        if len(self.batch) == 20000:
+            self.flush()
+
+    def flush(self):
+        self.db.executemany("INSERT INTO entries VALUES (?,?,?,?,?,?,?,?)", self.batch)
+        self.batch.clear()
+
+
+def build(english, languages):
+    """Rebuild the English database (if english) and the given languages from kaikki.org's index.
+
+    The translations into a language live in the English dump, so every build streams it once.
+    """
+    os.makedirs(LANG_DIR, exist_ok=True)
+    langs = []
+    for info in languages:
+        tmp = os.path.join(LANG_DIR, re.sub(r"\W+", "_", info["name"]) + ".db.new")
+        lang = {"name": info["name"], "code": None, "tmp": tmp, "db": new_db(tmp), "inverse": {}}
+        ins = Inserter(lang["db"])
+        for row in foreign_rows(download(dump_url(info), info["name"]), lang):
+            ins.add(row)
+        ins.flush()
+        print(f"\r  {info['name']}: {ins.n:,} entries" + " " * 20, file=sys.stderr)
+        if lang["code"]:
+            langs.append(lang)
+        else:
+            lang["db"].close()
+            os.remove(tmp)
+    main = None
+    if english:
+        main = {"tmp": DB + ".new"}
+        main["db"] = new_db(main["tmp"])
+        ins = Inserter(main["db"])
+        for row in wordnet_rows(download(wordnet_url(), "Open English WordNet")):
+            ins.add(row)
+        ins.flush()
+        print(f"\r  Open English WordNet: {ins.n:,} entries" + " " * 20, file=sys.stderr)
+    if main or langs:
+        targets = {None: Inserter(main["db"])} if main else {}
+        targets.update({lang["code"]: Inserter(lang["db"]) for lang in langs})
+        for target, row in english_rows(download(WIKTIONARY_URL, "Wiktionary (English)"), bool(main), langs):
+            targets[target].add(row)
+        for ins in targets.values():
+            ins.flush()
+        print(f"\r  Wiktionary (English): done" + " " * 30, file=sys.stderr)
+    print("  Indexing…", file=sys.stderr)
+    if TRACKER:
+        TRACKER.write(100, "indexing")
+    for lang in langs:
+        finish_db(lang["db"], lang["tmp"], os.path.join(LANG_DIR, lang["code"] + ".db"),
+                  {"code": lang["code"], "name": lang["name"]})
+    if main:
+        finish_db(main["db"], main["tmp"], DB, {})
+
+
+def resolve_all(names):
+    found = []
+    for name in names:
+        lang = resolve_language(name)
+        if not lang:
+            sys.exit(f"lexi: no language called '{name}' on kaikki.org (see lexi languages --all)")
+        found.append(lang)
+    return found
+
+
+def update(names=()):
+    installed = [l["name"] for l in installed_languages()]
+    languages = resolve_all(list(dict.fromkeys(installed + list(names))))
+    extra = " and " + ", ".join(l["name"] for l in languages) if languages else ""
+    print(f"Building the lexi dictionary (English{extra}). This downloads about 550 MB "
+          "and takes a few minutes.", file=sys.stderr)
+    build(True, languages)
+    print("Done.", file=sys.stderr)
+
+
+def add(names):
+    """Download languages (what the settings run in the background); notifies the desktop when done."""
+    languages = resolve_all(names)
+    label = ", ".join(l["name"] for l in languages)
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if not job_running():
+        with open(JOB_PID, "w") as f:
+            f.write(str(os.getpid()))
+    print(f"{T['downloading']} {label}…", file=sys.stderr)
+    global TRACKER
+    try:
+        TRACKER = Tracker([l["name"] for l in languages], [dump_url(l) for l in languages] + [WIKTIONARY_URL])
+        build(False, languages)
+        message = T["add_done"].format(label)
+    except Exception as e:
+        print(f"\nlexi: {e}", file=sys.stderr)
+        message = T["add_failed"].format(label, JOB_LOG)
+        raise
+    finally:
+        print(f"\n{message}", file=sys.stderr)
+        if shutil.which("notify-send") and not sys.stderr.isatty():
+            subprocess.run(["notify-send", "lexi", message])
+        for path in (JOB_PID, JOB_STATUS):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def remove_language(name):
+    n = name.strip().lower()
+    for lang in installed_languages():
+        if n in (lang["name"].lower(), lang["code"].lower(), DA_NAMES.get(lang["name"], "").lower()):
+            os.remove(lang["path"])
+            return lang["name"]
+    return None
 
 
 # ---------- main ----------
@@ -732,9 +1707,29 @@ def main():
         print(f"lexi {VERSION}")
     elif args[0] == "update":
         try:
-            update()
+            update(args[1:])
         except KeyboardInterrupt:
             sys.exit("\nlexi: update cancelled")
+    elif args[0] == "add":
+        if not args[1:]:
+            sys.exit("usage: lexi add LANGUAGE... (see lexi languages --all)")
+        try:
+            add(args[1:])
+        except KeyboardInterrupt:
+            sys.exit("\nlexi: cancelled")
+    elif args[0] == "remove":
+        for name in args[1:]:
+            removed = remove_language(name)
+            print(f"Removed {removed}." if removed else f"lexi: {name} isn't installed")
+    elif args[0] == "languages":
+        if args[1:] == ["--all"]:
+            for lang in language_index():
+                print(f"{lang['name']}  ({lang['senses']:,} senses)")
+        else:
+            for lang in installed_languages():
+                print(f"{lang['name']} ({lang['code']})")
+    elif args[0] == "settings":
+        launch(settings=True)
     elif args[0] == "--json":
         print(json.dumps(collect(" ".join(args[1:])), ensure_ascii=False))
     elif args[0] == "--complete":
@@ -742,12 +1737,15 @@ def main():
     elif args[0] == "--open":
         launch(" ".join(args[1:]) or None)
     elif args[0] == "--view":
-        view(" ".join(args[1:]))
+        if args[1:] == ["--settings"]:
+            Popup(None, settings=True).run()
+        else:
+            Popup(" ".join(args[1:]) or None).run()
     else:
         width = min(TEXT_WIDTH, shutil.get_terminal_size().columns - 2)
         lines, found = render(" ".join(args), width)
         if not sys.stdout.isatty():
-            lines = [re.sub(r"\033\[[0-9;]*m", "", l) for l in lines]
+            lines = [plain(l) for l in lines]
         print("\n".join(lines))
         sys.exit(0 if found else 1)
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Install lexi: copies the script, builds the dictionary, and on Omarchy adds a SUPER+ALT+D keybinding.
 #
-#   ./install.sh [--lang en|da] [--no-data] [--no-keybinding]
+#   ./install.sh [--lang en|da] [--language NAME]... [--no-data] [--no-keybinding]
 
 set -euo pipefail
 
@@ -12,11 +12,13 @@ KEY="SUPER + ALT + D"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 lang=""
+languages=()
 build_data=true
 keybinding=true
 while (( $# )); do
   case "$1" in
     --lang) lang="${2:?--lang needs a value}"; shift ;;
+    --language) languages+=("${2:?--language needs a value}"); shift ;;
     --no-data) build_data=false ;;
     --no-keybinding) keybinding=false ;;
     -h|--help) sed -n '2,4p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
@@ -36,7 +38,6 @@ if ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))'; then
   echo "lexi needs Python 3.8 or newer." >&2
   exit 1
 fi
-command -v less >/dev/null || note "Tip: install 'less' for scrolling in the popup."
 
 say "Installing lexi to $BIN_DIR/lexi"
 mkdir -p "$BIN_DIR"
@@ -46,21 +47,32 @@ case ":$PATH:" in
   *) note "$BIN_DIR is not on your PATH. Add it, or call lexi as $BIN_DIR/lexi." ;;
 esac
 
-if [[ -n $lang ]]; then
+set_config() {
   mkdir -p "$CONFIG_DIR"
   # Rewrite without sed -i, which differs between GNU and macOS.
   touch "$CONFIG_DIR/config"
-  { grep -v '^lang' "$CONFIG_DIR/config" || true; echo "lang = $lang"; } >"$CONFIG_DIR/config.new"
+  { grep -v "^$1" "$CONFIG_DIR/config" || true; echo "$1 = $2"; } >"$CONFIG_DIR/config.new"
   mv "$CONFIG_DIR/config.new" "$CONFIG_DIR/config"
+}
+
+if [[ -n $lang ]]; then
+  set_config lang "$lang"
   say "Interface language set to '$lang' in $CONFIG_DIR/config"
+fi
+# A Danish interface comes with the Danish dictionary unless other languages were asked for.
+if [[ $lang == da && ${#languages[@]} -eq 0 ]]; then
+  languages=(Danish)
 fi
 
 if $build_data; then
-  if [[ -f $DATA_DB ]]; then
-    say "Dictionary already built ($DATA_DB). Run 'lexi update' to refresh it."
-  else
+  if [[ ! -f $DATA_DB ]]; then
     say "Building the dictionary"
-    "$BIN_DIR/lexi" update
+    "$BIN_DIR/lexi" update "${languages[@]}"
+  elif (( ${#languages[@]} )); then
+    say "Adding ${languages[*]}"
+    "$BIN_DIR/lexi" add "${languages[@]}"
+  else
+    say "Dictionary already built ($DATA_DB). Run 'lexi update' to refresh it."
   fi
 fi
 

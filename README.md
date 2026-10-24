@@ -8,6 +8,8 @@ A fast, offline English dictionary for Linux and macOS. Press a key, type a word
 - **Modern:** Wiktionary is current, so it has words like *doomscrolling* and *rizz*.
 - **Follows references:** a word that only says "Alternative spelling of X" or "past tense of X" shows X's full definitions underneath.
 - **Forgives typos:** *arbitrtion* suggests *arbitration* and shows it.
+- **Any language, both ways:** add Danish, Swedish, German or any other language Wiktionary has, and *dog* also shows *en hund*, while *hund* shows its English meanings, inflections and pronunciation.
+- **A word journey:** type the next word straight into the popup, or click any word in the text. ← and → go back and forward.
 - **Fits the window to the content** on Hyprland and [Omarchy](https://omarchy.org): floating, centered and as tall as the entry needs.
 - **No dependencies** beyond Python 3, which is already on most systems.
 
@@ -25,7 +27,7 @@ The installer:
 2. Downloads the dictionaries (about 540 MB) and builds a local database (about 360 MB). This takes a few minutes, and the downloads are not kept.
 3. On Omarchy, binds **SUPER + ALT + D** to the popup. On other desktops it tells you what to bind.
 
-Options: `--lang da` for a Danish interface, `--no-data` to skip the download, and `--no-keybinding`.
+Options: `--lang da` for a Danish interface (which also adds the Danish dictionary), `--language NAME` to add a language (repeatable, e.g. `--language Swedish`), `--no-data` to skip the download, and `--no-keybinding`.
 
 ## Usage
 
@@ -33,12 +35,27 @@ Options: `--lang da` for a Danish interface, `--no-data` to skip the download, a
 lexi serendipity        # print the definition in the terminal
 lexi                    # ask for a word and show it in a popup
 lexi --open serendipity # open the popup for a word directly
+lexi settings           # open the settings in the popup
+lexi add Danish Swedish # download languages (a few minutes each time)
+lexi remove Swedish     # remove a language
+lexi languages --all    # every language you can add
 lexi update             # refresh the dictionaries from the latest Wiktionary dump
 lexi --json serendipity # the lookup as JSON, for integrations
 lexi --complete seren   # words starting with "seren", as JSON
 ```
 
-In the popup, scroll with the arrow keys or the mouse, search with `/` and close with `q` or `Esc`.
+In the popup:
+
+| | |
+|---|---|
+| Type a word, Enter | look it up (Tab completes) |
+| Click a word | look it up |
+| ← → | back and forward through the words you looked up |
+| ↑ ↓, PgUp PgDn, Space, mouse wheel | scroll |
+| Ctrl+S | settings |
+| Esc | clear what you typed, or close |
+
+Clicking takes over the mouse, so hold Shift to select text.
 
 ## Works with
 
@@ -66,7 +83,21 @@ lang = en          # interface language: en or da
 font_size = 12     # popup font size
 width = 76         # text column width
 terminal = kitty   # preferred terminal for the popup
+wordnet = on       # show WordNet's definitions below Wiktionary's
 ```
+
+The settings page in the popup (Ctrl+S, or `lexi settings`) changes these too.
+
+### Other languages
+
+Open the settings, type to filter the list of languages, press Space on the ones you want and Enter to download them. The download runs in the background, and a notification tells you when it's done. From the terminal: `lexi add Danish`.
+
+Each language adds two sections to lookups:
+
+- **English → Danish** for English words, from Wiktionary's translation tables. Nouns show their gender (*en hund*, *Hund m*). Inflected forms use their base word, so *ran* shows the translations of *run*.
+- **Danish → English** for words in that language, with inflections and pronunciation. Inflected forms such as *hunden* show *hund*.
+
+A word in both languages, such as *and* (Danish for duck), shows both. The translations into a language are in the English Wiktionary download, so adding languages downloads it again (about 535 MB); languages added together share one download. Each language is a separate file in `~/.local/share/lexi/languages/`.
 
 Each setting can also be set as an environment variable, e.g. `LEXI_LANG=da`.
 
@@ -81,5 +112,5 @@ Each setting can also be set as an environment variable, e.g. `LEXI_LANG=da`.
 
 lexi is MIT licensed. The dictionary data is downloaded from its sources and is not part of this repository:
 
-- Wiktionary content via [kaikki.org](https://kaikki.org) (Wiktextract), licensed [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) and GFDL.
+- Wiktionary content (English and the languages you add) via [kaikki.org](https://kaikki.org) (Wiktextract), licensed [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) and GFDL.
 - [Open English WordNet](https://github.com/globalwordnet/english-wordnet), licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
