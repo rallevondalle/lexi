@@ -37,6 +37,7 @@ import sys
 import textwrap
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -268,6 +269,20 @@ def wrap(text, width, indent, hang, *codes, lead=None):
     return out
 
 
+def fold(text):
+    """Lowercase without accents, so "kutta" matches the romanization "kuttā"."""
+    return "".join(c for c in unicodedata.normalize("NFKD", text.lower()) if not unicodedata.combining(c))
+
+
+def aliases(db, key):
+    """Words written in another script whose romanization is key, e.g. कुत्ता for "kutta"."""
+    try:
+        return [r[0] for r in db.execute("SELECT DISTINCT target FROM aliases WHERE key IN (?, ?) LIMIT 5",
+                                         (key, fold(key)))]
+    except sqlite3.OperationalError:
+        return []  # languages downloaded before romanizations were kept
+
+
 def connect(path):
     return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
 
@@ -372,7 +387,8 @@ def collect(word):
     def lookup(key):
         # Databases from before languages had their own files may still hold Danish rows; skip them.
         return ([r for r in fetch(main, key) if r[1] in (WIKT, WORDNET)],
-                [fetch(db, key) for _, db in langs])
+                [fetch(db, key) or [r for target in aliases(db, key) for r in fetch(db, target)]
+                 for _, db in langs])
 
     key = query.lower()
     main_rows, lang_rows = lookup(key)
@@ -388,7 +404,8 @@ def collect(word):
     # The exact spelling (e.g. "free" before "Free") comes first.
     everything = sorted(main_rows, key=lambda r: (r[1], r[0] != query)) + [r for rows in lang_rows for r in rows]
     result["headword"] = everything[0][0]
-    result["ipa"] = next((r[3] for r in everything if r[3]), None)
+    # An English headword only takes an English pronunciation.
+    result["ipa"] = next((r[3] for r in (main_rows or everything) if r[3]), None)
 
     seen = {key}
     english = follow(main, ("Wiktionary", "main", [r for r in sorted(main_rows, key=lambda r: r[0] != query)
@@ -867,11 +884,17 @@ class Popup:
         if row < 0 or i >= len(self.lines):
             return None
         text, col = plain(self.lines[i]), col - self.pad()
-        for m in re.finditer(r"[\w'’-]+", text):
-            if m.start() <= col < m.end():
-                word = m.group().strip("'’-")
-                return word if len(word) > 1 and not word.isdigit() else None
-        return None
+        if not 0 <= col < len(text):
+            return None
+        # Letters, digits and combining marks (the vowel signs in कुत्ता), plus ' and -.
+        inside = lambda c: unicodedata.category(c)[0] in "LMN" or c in "'’-"
+        start = end = col
+        while start > 0 and inside(text[start - 1]):
+            start -= 1
+        while end < len(text) and inside(text[end]):
+            end += 1
+        word = text[start:end].strip("'’-")
+        return word if len(word) > 1 and not word.isdigit() else None
 
 
 # ---------- settings ----------
@@ -1419,7 +1442,7 @@ def translations(e, codes):
         if code not in codes or not t.get("word"):
             continue
         words = groups.setdefault(code, {}).setdefault((t.get("sense") or "").strip(), [])
-        word = with_gender(t["word"], t.get("tags"), code)
+        word = with_gender(t["word"], t.get("tags"), code) + (f" ({t['roman']})" if t.get("roman") else "")
         if word not in words and len(words) < 8:
             words.append(word)
     return {code: [[0, (f"({sense}) " if sense else "") + ", ".join(words), None] for sense, words in g.items()]
@@ -1480,6 +1503,11 @@ def foreign_rows(stream, lang):
         senses = parse_senses(e)
         if not senses:
             continue
+        key = e["word"].lower()
+        roman = next((f["form"] for f in e.get("forms", []) if "romanization" in (f.get("tags") or [])), None)
+        if roman:
+            for alias in {roman.lower(), fold(roman)} - {key}:
+                lang["aliases"].add((alias, key))
         pos = e.get("pos")
         for s in e.get("senses", []):
             tags = s.get("tags") or []
@@ -1558,6 +1586,7 @@ def new_db(path):
         CREATE TABLE entries (key TEXT, word TEXT, source INT, pos TEXT, ipa TEXT, etym TEXT, senses TEXT,
                               forms TEXT);
         CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT);
+        CREATE TABLE aliases (key TEXT, target TEXT);
     """)
     return db
 
@@ -1566,7 +1595,8 @@ def finish_db(db, tmp, path, meta):
     db.executemany("INSERT INTO meta VALUES (?, ?)", meta.items())
     db.executescript("""
         CREATE INDEX entries_key ON entries (key);
-        CREATE TABLE words AS SELECT DISTINCT key FROM entries;
+        CREATE INDEX aliases_key ON aliases (key);
+        CREATE TABLE words AS SELECT key FROM entries UNION SELECT key FROM aliases;
         CREATE INDEX words_key ON words (key);
         VACUUM;
     """)
@@ -1599,11 +1629,12 @@ def build(english, languages):
     langs = []
     for info in languages:
         tmp = os.path.join(LANG_DIR, re.sub(r"\W+", "_", info["name"]) + ".db.new")
-        lang = {"name": info["name"], "code": None, "tmp": tmp, "db": new_db(tmp), "inverse": {}}
+        lang = {"name": info["name"], "code": None, "tmp": tmp, "db": new_db(tmp), "inverse": {}, "aliases": set()}
         ins = Inserter(lang["db"])
         for row in foreign_rows(download(dump_url(info), info["name"]), lang):
             ins.add(row)
         ins.flush()
+        lang["db"].executemany("INSERT INTO aliases VALUES (?, ?)", sorted(lang["aliases"]))
         print(f"\r  {info['name']}: {ins.n:,} entries" + " " * 20, file=sys.stderr)
         if lang["code"]:
             langs.append(lang)
