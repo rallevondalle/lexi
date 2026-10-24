@@ -20,6 +20,7 @@ In the popup: type a word and press Enter to look it up, or click a word.
 ← and → go back and forward, ↑ ↓ and the mouse wheel scroll, Ctrl+S opens
 the settings and Esc closes.
 """
+import bz2
 import codecs
 import difflib
 import glob
@@ -70,6 +71,12 @@ WORDNET_FALLBACK = ("https://github.com/globalwordnet/english-wordnet/releases/d
 # The main database holds WIKT and WORDNET; each language's database holds FOREIGN (its words with
 # English glosses) and EN_X (English words with their translations into it).
 WIKT, WORDNET, FOREIGN, EN_X = 0, 1, 2, 3
+# Definitions written in the language itself: from its own Wiktionary (NATIVE) or DanNet (DANNET).
+NATIVE, DANNET = 4, 5
+
+DAWIKT_URL = "https://dumps.wikimedia.org/dawiktionary/latest/dawiktionary-latest-pages-articles.xml.bz2"
+DANNET_RELEASES = "https://api.github.com/repos/kuhumcst/DanNet/releases/latest"
+DANNET_FALLBACK = "https://github.com/kuhumcst/DanNet/releases/download/v2026-10-02/dannet-wn-lmf.xml.gz"
 
 
 # ---------- configuration ----------
@@ -167,7 +174,9 @@ STRINGS = {
         "indexing": "indexing",
         "add_done": "{} is ready in lexi",
         "add_failed": "Downloading {} failed. See {}",
-        "no_translation": "Wiktionary has no translation of this word.",
+        "no_translation": "Wiktionary has no translation into {}.",
+        "native": "{} definition",
+        "explained": "{}: English definition",
     },
     "da": {
         "prompt": "Slå ord op",
@@ -211,7 +220,9 @@ STRINGS = {
         "indexing": "indekseres",
         "add_done": "{} er klar i lexi",
         "add_failed": "Kunne ikke hente {}. Se {}",
-        "no_translation": "Wiktionary har ingen oversættelse af ordet.",
+        "no_translation": "Wiktionary har ingen oversættelse til {}.",
+        "native": "{} forklaring",
+        "explained": "{}: engelsk forklaring",
     },
 }
 INTERFACES = {"en": "English", "da": "Dansk"}
@@ -377,7 +388,7 @@ def collect(word):
     """
     query = word.strip()
     result = {"query": query, "found": False, "suggestions": [], "headword": None, "ipa": None,
-              "sections": [], "origins": []}
+              "sections": [], "origins": [], "untranslated": []}
     if not os.path.exists(DB):
         result["error"] = "no_db"
         return result
@@ -426,16 +437,27 @@ def collect(word):
             translations = [r for r in fetch(db, target) if r[1] == EN_X]
             if translations:
                 title += ": " + target
-        sections.append((title, "translation", translations))
-        sections += follow(db, (capitalize(T["x_en"].format(name)), "foreign", [r for r in rows if r[1] == FOREIGN]),
-                           seen, 3)
+        if translations:
+            sections.append((title, "translation", translations))
+        elif main_rows and not any(r[1] in (FOREIGN, NATIVE, DANNET) for r in rows):
+            result["untranslated"].append(name)
+        # The language's own explanation: its Wiktionary's full definitions, else DanNet's shortened ones.
+        native = [r for r in rows if r[1] == NATIVE] or [r for r in rows if r[1] == DANNET]
+        if native:
+            source = "Wiktionary" if native[0][1] == NATIVE else "DanNet"
+            sections.append((capitalize(T["native"].format(name)) + " · " + source, "native", native))
+        foreign = follow(db, (capitalize(T["x_en"].format(name)), "foreign", [r for r in rows if r[1] == FOREIGN]),
+                         seen, 3)
+        sections += foreign
+        if not native:
+            sections += explained(main, [r for _, _, entries in foreign for r in entries], seen)
     sections += english
     if wordnet and wordnet_on():
         sections.append(("WordNet", "wordnet", wordnet))
 
     origins, foreign_origins = [], []
     for title, kind, entries in sections:
-        if not entries and not (kind == "translation" and main_rows):
+        if not entries:
             continue
         ipa = next((r[3] for r in entries if r[3]), None)
         result["sections"].append({
@@ -450,11 +472,36 @@ def collect(word):
                 for w, _, pos, _, _, senses, forms in entries
             ],
         })
-        if kind != "translation":
+        if kind not in ("translation", "native", "explained"):
             (foreign_origins if entries and entries[0][1] == FOREIGN else origins).extend(r[4] for r in entries if r[4])
     # Other languages' etymologies only when there is no English one, so "and" doesn't mix the two.
     result["origins"] = list(dict.fromkeys(origins or foreign_origins))[:3]
     return result
+
+
+def explained(main, entries, seen, limit=2):
+    """English definitions of the words that foreign entries translate to, e.g. transitiv → transitive."""
+    out = []
+    for _, _, pos, _, _, senses, _ in entries:
+        for _, gloss, _ in json.loads(senses):
+            if REF.match(gloss.strip()):
+                continue
+            for part in re.split(r"[,;]", re.sub(r"\([^)]*\)", "", gloss)):
+                part = part.strip().lower()
+                if pos == "verb" and part.startswith("to "):
+                    part = part[3:]
+                if not part or len(part.split()) > 3 or part in seen:
+                    continue
+                rows = [r for r in fetch(main, part) if r[1] == WIKT and r[2] == pos]
+                if rows:
+                    seen.add(part)
+                    # A short version: the first three top-level senses, without examples.
+                    top = [[0, g, None] for d, g, _ in json.loads(rows[0][5]) if d == 0][:3]
+                    row = rows[0][:4] + (None, json.dumps(top, ensure_ascii=False), None)
+                    out.append((T["explained"].format(part), "explained", [row]))
+                    if len(out) == limit:
+                        return out
+    return out
 
 
 def unescape(text):
@@ -475,9 +522,11 @@ def render(word, width):
 
     headword = data["headword"]
     out.append(style(headword, ACCENT) + ("   " + style(data["ipa"], DIM) if data["ipa"] else ""))
+    if data["untranslated"]:
+        out += wrap(T["no_translation"].format(", ".join(data["untranslated"])), width, 0, 0, DIM)
     sections = data["sections"]
     for i, sec in enumerate(sections):
-        if len(sections) > 1 or sec["kind"] in ("foreign", "translation"):
+        if len(sections) > 1 or sec["kind"] in ("foreign", "translation", "native"):
             ref = sec["kind"] not in ("main", "wordnet")
             head = f" {sec['title']} "
             line = style("── ", DIM) + style(sec["title"], ACCENT if ref else DIM) + " "
@@ -485,9 +534,6 @@ def render(word, width):
                 line += style(sec["ipa"], DIM) + " "
                 head += sec["ipa"] + " "
             out += ["", line + style("─" * max(2, width - len(head) - 3), DIM)]
-        if not sec["entries"]:
-            out += ["", style(T["no_translation"], DIM)]
-            continue
         base = headword if sec["kind"] != "reference" else sec["entries"][0]["word"]
         for entry in sec["entries"]:
             label = (entry["pos"] or "").upper()
@@ -1530,7 +1576,7 @@ def foreign_rows(stream, lang):
 WN_POS = {"n": "noun", "v": "verb", "a": "adj", "s": "adj", "r": "adv"}
 
 
-def wordnet_rows(stream):
+def wordnet_rows(stream, source=WORDNET):
     synsets, entries = {}, []
     for _, el in ET.iterparse(gzip.open(stream)):
         if el.tag == "LexicalEntry":
@@ -1560,7 +1606,7 @@ def wordnet_rows(stream):
             gloss = s["def"] + (f"  [syn: {', '.join(syn)}]" if syn else "")
             senses.append([0, gloss, s["ex"][0] if s["ex"] else None])
         if senses:
-            yield (word.lower(), word, WORDNET, WN_POS.get(pos, pos), None, None,
+            yield (word.lower(), word, source, WN_POS.get(pos, pos), None, None,
                    json.dumps(senses, ensure_ascii=False), None)
 
 
@@ -1574,6 +1620,102 @@ def wordnet_url():
     except (OSError, ValueError, KeyError):
         pass
     return WORDNET_FALLBACK
+
+
+# Part-of-speech headings in the Danish Wiktionary, e.g. {{-noun-|da}}.
+DA_POS = {"noun": "noun", "verb": "verb", "adj": "adj", "adv": "adv", "prop": "name", "interj": "intj",
+          "abr": "abbrev", "phr": "phrase", "expr": "phrase", "pp": "pron", "pron": "pron", "end": "suffix",
+          "suf": "suffix", "prep": "prep", "pref": "prefix", "prov": "proverb", "conj": "conj", "num": "num",
+          "art": "article", "particle": "particle"}
+
+
+def wiki_template(m):
+    """{{term|x}} and {{l|da|x}} become x; other templates (labels, genders, boxes) are dropped."""
+    parts = m.group(1).split("|")
+    name, args = parts[0].strip(), [p for p in parts[1:] if "=" not in p]
+    if name in ("term", "w", "ordet") and args:
+        return args[0]
+    if name in ("l", "m", "link") and len(args) > 1:
+        return args[1]
+    return ""
+
+
+def wikiclean(text):
+    """Wikitext as plain text: links, templates, bold and italics, references."""
+    text = re.sub(r"<ref[^>]*/>|<ref.*?</ref>", "", text, flags=re.S)
+    text = re.sub(r"<[^>]+>", "", text)
+    for _ in range(3):  # templates inside templates
+        text = re.sub(r"\{\{([^{}]*)\}\}", wiki_template, text)
+    text = re.sub(r"\[\[(?:Fil|File|Billede|Image|Kategori|Category):[^\]]*\]\]", "", text)
+    text = re.sub(r"\[\[[^\]|]*\|([^\]]*)\]\]", r"\1", text)
+    text = re.sub(r"\[\[([^\]]*)\]\]", r"\1", text)
+    text = re.sub(r"'{2,}", "", text)
+    text = re.sub(r"\(\s*([^()]*?)\s*\)\s*:", r"(\1)", text)  # "(zoologi):" → "(zoologi)"
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def da_wiktionary_rows(stream):
+    """Danish words with Danish definitions and examples, from the Danish Wiktionary's dump."""
+    for _, el in ET.iterparse(bz2.open(stream)):
+        if not el.tag.endswith("}page"):
+            continue
+        title = ns = text = None
+        for c in el.iter():
+            tag = c.tag.rsplit("}", 1)[-1]
+            if tag == "title":
+                title = c.text
+            elif tag == "ns":
+                ns = c.text
+            elif tag == "text":
+                text = c.text or ""
+        el.clear()
+        if ns != "0" or not title or not text or "{{=da=}}" not in text:
+            continue
+        section = re.split(r"\{\{=[\w-]+=\}\}", text.split("{{=da=}}", 1)[1])[0]
+        entries, senses = [], None
+        for line in section.splitlines():
+            line = line.strip()
+            m = re.match(r"^=*\s*\{\{-([\w-]+)-(?:\|([^}|]*))?[^}]*\}\}", line)
+            if m:
+                # Pages sometimes add other languages without a {{=xx=}} heading: {{-noun-|sv}}.
+                pos = DA_POS.get(m.group(1)) if m.group(2) in (None, "", "da") else None
+                senses = [] if pos else None
+                if pos:
+                    entries.append((pos, senses))
+                continue
+            if senses is None:
+                continue
+            if re.match(r"^##[^:*#]", line):
+                senses.append([1, wikiclean(line[2:]), None])
+            elif re.match(r"^#[^:*#]", line):
+                senses.append([0, wikiclean(line[1:]), None])
+            elif re.match(r"^#+[:*]", line) and senses and senses[-1][2] is None:
+                example = wikiclean(re.sub(r"^#+[:*]+", "", line))
+                if example and len(example) <= 220:
+                    senses[-1][2] = example
+        for pos, senses in entries:
+            senses = [s for s in senses if s[1]]
+            if senses:
+                yield (title.lower(), title, NATIVE, pos, None, None, json.dumps(senses, ensure_ascii=False), None)
+
+
+def dannet_url():
+    try:
+        with urllib.request.urlopen(DANNET_RELEASES, timeout=20) as r:
+            for a in json.load(r).get("assets", []):
+                if a["name"] == "dannet-wn-lmf.xml.gz":
+                    return a["browser_download_url"]
+    except (OSError, ValueError, KeyError):
+        pass
+    return DANNET_FALLBACK
+
+
+def extras(name):
+    """Definitions in the language itself, for languages that have an open source of them."""
+    if name == "Danish":
+        return [("Wiktionary (dansk)", DAWIKT_URL, da_wiktionary_rows),
+                ("DanNet", dannet_url(), lambda stream: wordnet_rows(stream, DANNET))]
+    return []
 
 
 def new_db(path):
@@ -1635,6 +1777,10 @@ def build(english, languages):
             ins.add(row)
         ins.flush()
         lang["db"].executemany("INSERT INTO aliases VALUES (?, ?)", sorted(lang["aliases"]))
+        for label, url, parse in extras(info["name"]):
+            for row in parse(download(url, label)):
+                ins.add(row)
+            ins.flush()
         print(f"\r  {info['name']}: {ins.n:,} entries" + " " * 20, file=sys.stderr)
         if lang["code"]:
             langs.append(lang)
@@ -1699,7 +1845,8 @@ def add(names):
     print(f"{T['downloading']} {label}…", file=sys.stderr)
     global TRACKER
     try:
-        TRACKER = Tracker([l["name"] for l in languages], [dump_url(l) for l in languages] + [WIKTIONARY_URL])
+        urls = [u for l in languages for u in [dump_url(l)] + [url for _, url, _ in extras(l["name"])]]
+        TRACKER = Tracker([l["name"] for l in languages], urls + [WIKTIONARY_URL])
         build(False, languages)
         message = T["add_done"].format(label)
     except Exception as e:

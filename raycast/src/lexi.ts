@@ -22,7 +22,7 @@ export interface Entry {
 
 export interface Section {
   title: string;
-  kind: "main" | "reference" | "wordnet" | "translation" | "foreign";
+  kind: "main" | "reference" | "wordnet" | "translation" | "foreign" | "native" | "explained";
   ipa: string | null;
   entries: Entry[];
 }
@@ -35,6 +35,7 @@ export interface LookupResult {
   ipa: string | null;
   sections: Section[];
   origins: string[];
+  untranslated?: string[];
   error?: "no_db";
 }
 
@@ -141,6 +142,9 @@ export function toMarkdown(result: LookupResult): string {
   if (result.ipa) {
     out.push("", `\`${result.ipa}\``);
   }
+  if (result.untranslated?.length) {
+    out.push("", `*Wiktionary has no translation into ${result.untranslated.join(", ")}.*`);
+  }
   for (const section of result.sections) {
     if (result.sections.length > 1) {
       if (section.kind === "reference") {
@@ -151,9 +155,6 @@ export function toMarkdown(result: LookupResult): string {
       } else {
         out.push("", "---", "", `#### ${section.title}`);
       }
-    }
-    if (section.kind === "translation" && !section.entries.length) {
-      out.push("", "*Wiktionary has no translation of this word.*");
     }
     out.push(...entriesMarkdown(section.entries));
   }

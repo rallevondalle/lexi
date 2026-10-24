@@ -97,6 +97,11 @@ Each language adds two sections to lookups:
 - **English → Danish** for English words, from Wiktionary's translation tables. Nouns show their gender (*en hund*, *Hund m*). Inflected forms use their base word, so *ran* shows the translations of *run*.
 - **Danish → English** for words in that language, with inflections and pronunciation. Inflected forms such as *hunden* show *hund*.
 
+Words in a language are also explained, so you understand them and not only their English translation:
+
+- **Danish** gets Danish definitions in Danish: from the [Danish Wiktionary](https://da.wiktionary.org) (about 11,000 words, with examples) and otherwise from [DanNet](https://wordnet.dk) (about 52,000 words; its definitions are shortened by design).
+- **Every language** shows the English definition of what a word translates to, e.g. *transitiv* → *transitive*, when there is no definition in the language itself.
+
 A word in both languages, such as *and* (Danish for duck), shows both. The translations into a language are in the English Wiktionary download, so adding languages downloads it again (about 535 MB); languages added together share one download. Each language is a separate file in `~/.local/share/lexi/languages/`.
 
 Each setting can also be set as an environment variable, e.g. `LEXI_LANG=da`.
@@ -114,3 +119,4 @@ lexi is MIT licensed. The dictionary data is downloaded from its sources and is 
 
 - Wiktionary content (English and the languages you add) via [kaikki.org](https://kaikki.org) (Wiktextract), licensed [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/) and GFDL.
 - [Open English WordNet](https://github.com/globalwordnet/english-wordnet), licensed [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).
+- With Danish: the [Danish Wiktionary](https://da.wiktionary.org) (CC BY-SA 4.0) and [DanNet](https://wordnet.dk/dannet) by the University of Copenhagen and the Danish Language and Literature Society (CC BY-SA 4.0).
