@@ -95,7 +95,7 @@ if $keybinding; then
     say "Hyprland detected. Add a keybinding yourself, e.g. in hyprland.conf:"
     note "bind = SUPER ALT, D, exec, $BIN_DIR/lexi"
   elif [[ $(uname) == Darwin ]]; then
-    say "On macOS, use the Raycast extension for the popup: see raycast/README.md"
+    say "On macOS, use the Alfred workflow or the Raycast extension: see alfred/README.md or raycast/README.md"
   else
     say "Bind a key to '$BIN_DIR/lexi' in your desktop's keyboard shortcut settings to get the popup."
   fi

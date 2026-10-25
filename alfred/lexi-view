@@ -1,0 +1,3 @@
+#!/bin/bash
+# Text View source: the word typed in the view, else the one passed in as $word.
+exec "$(dirname "$0")/run.sh" view "$@"

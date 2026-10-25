@@ -1,6 +1,6 @@
 # lexi
 
-A fast, offline English dictionary for Linux and macOS. Press a key, type a word and get a clean popup with definitions, pronunciation, examples and etymology. It also works as a plain terminal command, and on macOS as a [Raycast extension](raycast/).
+A fast, offline English dictionary for Linux and macOS. Press a key, type a word and get a clean popup with definitions, pronunciation, examples and etymology. It also works as a plain terminal command, and on macOS as an [Alfred workflow](alfred/) or a [Raycast extension](raycast/).
 
 ![lexi showing "tesselate"](docs/screenshot.png)
 
@@ -64,15 +64,18 @@ Clicking takes over the mouse, so hold Shift to select text.
 | Omarchy | ✓ | ✓ | ✓ |
 | Hyprland | ✓ | ✓ | ✓ |
 | Other Linux desktops | ✓ | ✓ (normal terminal window) | |
-| macOS | ✓ | ✓ with [Raycast](raycast/), or Terminal.app | Raycast |
+| macOS | ✓ | ✓ with [Alfred](alfred/) or [Raycast](raycast/), or Terminal.app | Alfred, Raycast |
 
 lexi asks for the word using the first of these it finds: `omarchy-menu-input`, `fuzzel`, `wofi`, `tofi`, `rofi`, `bemenu`, `zenity`, `kdialog` or, on macOS, a native dialog. If none is available, it asks inside the popup.
 
 The popup opens in the first available terminal: `foot`, `kitty`, `alacritty`, `ghostty`, `wezterm`, `xdg-terminal-exec`, `gnome-terminal`, `konsole` or `xterm`, and on macOS Terminal.app.
 
-### macOS and Raycast
+### macOS: Alfred and Raycast
 
-On macOS the nicest way to use lexi is the [Raycast extension](raycast/): words appear as you type, and the definition shows in Raycast's detail pane. It can also look up the word you have selected in any app. Install lexi with `./install.sh` first, then see [raycast/README.md](raycast/README.md).
+On macOS the nicest way to use lexi is from a launcher. Install lexi with `./install.sh` first.
+
+- **[Alfred workflow](alfred/):** words appear as you type, each with its first definition, and ↩ shows the full entry. Every word you open is saved, so the keyword on its own lists the words you have looked up. A second keyword holds the settings: interface language, WordNet and dictionaries. See [alfred/README.md](alfred/README.md).
+- **[Raycast extension](raycast/):** words appear as you type, and the definition shows in Raycast's detail pane. It can also look up the word you have selected in any app. See [raycast/README.md](raycast/README.md).
 
 ## Configuration
 

@@ -1857,6 +1857,10 @@ def add(names):
         print(f"\n{message}", file=sys.stderr)
         if shutil.which("notify-send") and not sys.stderr.isatty():
             subprocess.run(["notify-send", "lexi", message])
+        elif sys.platform == "darwin" and not sys.stderr.isatty():
+            notify = ("const app = Application.currentApplication(); app.includeStandardAdditions = true; "
+                      f"app.displayNotification({json.dumps(message)}, {{withTitle: 'lexi'}})")
+            subprocess.run(["osascript", "-l", "JavaScript", "-e", notify])
         for path in (JOB_PID, JOB_STATUS):
             try:
                 os.remove(path)
